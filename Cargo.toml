@@ -43,6 +43,7 @@ clap = { version = "4.5", features = ["derive"] }
 # versions when bumping to a new release, and only increase the minimum when absolutely necessary.
 # When updating this, also update the "windows-version" matrix in the CI workflow.
 [target.'cfg(target_os = "windows")'.dependencies]
+windows-core = "0.62.2"
 windows = { version = ">=0.58, <=0.62", features = [
     "Win32_Media_Audio",
     "Win32_Foundation",
@@ -55,7 +56,8 @@ windows = { version = ">=0.58, <=0.62", features = [
     "Win32_System_Variant",
     "Win32_Media_Multimedia",
     "Win32_UI_Shell_PropertiesSystem",
-    "Win32_Media_Audio"
+    "Win32_Media_Audio",
+    "Win32_System_ProcessStatus",
 ] }
 audio_thread_priority = { version = "0.34", optional = true }
 asio-sys = { version = "0.2", path = "asio-sys", optional = true }

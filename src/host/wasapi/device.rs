@@ -1,6 +1,5 @@
 use crate::traits::{
-    BuildSink, BuildSource, Captures, EventHandle, HostTrait, Period, Periodcity, Renders, Sink,
-    Source,
+    BuildSink, BuildSource, Captures, EventHandle, Period, Periodcity, Renders, Sink, Source,
 };
 use crate::FrameCount;
 use crate::{
@@ -24,7 +23,7 @@ use super::{windows_err_to_cpal_err, windows_err_to_cpal_err_message};
 use windows::core::Interface;
 use windows::core::GUID;
 use windows::Win32::Devices::Properties;
-use windows::Win32::Foundation;
+use windows::Win32::Foundation::{self, MAX_PATH};
 use windows::Win32::Media::Audio::{
     AudioCategory_Media, AudioClientProperties, IAudioCaptureClient, IAudioClient3,
     IAudioRenderClient, WAVEFORMATEX,
@@ -32,7 +31,10 @@ use windows::Win32::Media::Audio::{
 use windows::Win32::Media::{Audio, KernelStreaming, Multimedia};
 use windows::Win32::System::Com;
 use windows::Win32::System::Com::{StructuredStorage, STGM_READ};
-use windows::Win32::System::Threading;
+use windows::Win32::System::ProcessStatus::K32GetModuleBaseNameW;
+use windows::Win32::System::Threading::{
+    self, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+};
 use windows::Win32::System::Variant::VT_LPWSTR;
 
 use super::stream::{AudioClientFlow, Stream, StreamInner};
@@ -47,15 +49,22 @@ struct IAudioClientWrapper(Audio::IAudioClient);
 unsafe impl Send for IAudioClientWrapper {}
 unsafe impl Sync for IAudioClientWrapper {}
 
+#[derive(Debug, Clone)]
+pub struct ProcessCapture {
+    pid: u32,
+    capture_tree: bool,
+}
+
+#[derive(Debug, Clone)]
 pub enum DeviceInner {
     MMDevice(Audio::IMMDevice),
-    ProcessCapture(u32),
+    ProcessCapture(ProcessCapture),
 }
 
 /// An opaque type that identifies an end point.
 #[derive(Clone)]
 pub struct Device {
-    device: Audio::IMMDevice,
+    device: DeviceInner,
     /// We cache an uninitialized `IAudioClient` so that we can call functions from it without
     /// having to create/destroy audio clients all the time.
     future_audio_client: Arc<Mutex<Option<IAudioClientWrapper>>>, // TODO: add NonZero around the ptr
@@ -191,6 +200,8 @@ pub unsafe fn is_format_supported(
     // `IsFormatSupported` can return `S_FALSE` (which means that a compatible format
     // has been found, but not an exact match) so we also treat this as unsupported.
     match result {
+        // The IAudioClient for process capture doesn't support querying for supported format
+        Foundation::E_NOTIMPL => Ok(true),
         Audio::AUDCLNT_E_DEVICE_INVALIDATED => Err(SupportedStreamConfigsError::DeviceNotAvailable),
         r if r.is_err() => Ok(false),
         Foundation::S_FALSE => Ok(false),
@@ -282,74 +293,99 @@ unsafe fn format_from_waveformatex_ptr(
     Some(format)
 }
 
+fn get_process_name_from_pid(pid: u32) -> Result<String, windows::core::Error> {
+    unsafe {
+        // Open process with query rights
+        let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid)?;
+        let mut buffer = [0u16; MAX_PATH as usize];
+
+        let len = K32GetModuleBaseNameW(handle, None, &mut buffer);
+        let name = String::from_utf16_lossy(&buffer[..len as usize]);
+        Ok(name)
+    }
+}
+
 unsafe impl Send for Device {}
 unsafe impl Sync for Device {}
 
 impl Device {
     pub fn name(&self) -> Result<String, DeviceNameError> {
         unsafe {
-            // Open the device's property store.
-            let property_store = self
-                .device
-                .OpenPropertyStore(STGM_READ)
-                .expect("could not open property store");
+            match &self.device {
+                DeviceInner::MMDevice(dev) => {
+                    // Open the device's property store.
+                    let property_store = dev
+                        .OpenPropertyStore(STGM_READ)
+                        .expect("could not open property store");
 
-            // Get the endpoint's friendly-name property.
-            let mut property_value = property_store
-                .GetValue(&Properties::DEVPKEY_Device_FriendlyName as *const _ as *const _)
-                .map_err(|err| {
-                    let description =
-                        format!("failed to retrieve name from property store: {}", err);
-                    let err = BackendSpecificError { description };
-                    DeviceNameError::from(err)
-                })?;
+                    // Get the endpoint's friendly-name property.
+                    let mut property_value = property_store
+                        .GetValue(&Properties::DEVPKEY_Device_FriendlyName as *const _ as *const _)
+                        .map_err(|err| {
+                            let description =
+                                format!("failed to retrieve name from property store: {}", err);
+                            let err = BackendSpecificError { description };
+                            DeviceNameError::from(err)
+                        })?;
 
-            let prop_variant = &property_value.Anonymous.Anonymous;
+                    let prop_variant = &property_value.Anonymous.Anonymous;
 
-            // Read the friendly-name from the union data field, expecting a *const u16.
-            if prop_variant.vt != VT_LPWSTR {
-                let description = format!(
-                    "property store produced invalid data: {:?}",
-                    prop_variant.vt
-                );
-                let err = BackendSpecificError { description };
-                return Err(err.into());
+                    // Read the friendly-name from the union data field, expecting a *const u16.
+                    if prop_variant.vt != VT_LPWSTR {
+                        let description = format!(
+                            "property store produced invalid data: {:?}",
+                            prop_variant.vt
+                        );
+                        let err = BackendSpecificError { description };
+                        return Err(err.into());
+                    }
+                    let ptr_utf16 = *(&prop_variant.Anonymous as *const _ as *const *const u16);
+
+                    // Find the length of the friendly name.
+                    let mut len = 0;
+                    while *ptr_utf16.offset(len) != 0 {
+                        len += 1;
+                    }
+
+                    // Create the utf16 slice and convert it into a string.
+                    let name_slice = slice::from_raw_parts(ptr_utf16, len as usize);
+                    let name_os_string: OsString = OsStringExt::from_wide(name_slice);
+                    let name_string = match name_os_string.into_string() {
+                        Ok(string) => string,
+                        Err(os_string) => os_string.to_string_lossy().into(),
+                    };
+
+                    // Clean up the property.
+                    StructuredStorage::PropVariantClear(&mut property_value).ok();
+                    Ok(name_string)
+                }
+                DeviceInner::ProcessCapture(proc) => {
+                    let name = get_process_name_from_pid(proc.pid).unwrap_or("Unknown".into());
+                    let tree = if proc.capture_tree { "tree " } else { "" };
+                    Ok(format!("[{tree}{}] {name}", proc.pid))
+                }
             }
-            let ptr_utf16 = *(&prop_variant.Anonymous as *const _ as *const *const u16);
-
-            // Find the length of the friendly name.
-            let mut len = 0;
-            while *ptr_utf16.offset(len) != 0 {
-                len += 1;
-            }
-
-            // Create the utf16 slice and convert it into a string.
-            let name_slice = slice::from_raw_parts(ptr_utf16, len as usize);
-            let name_os_string: OsString = OsStringExt::from_wide(name_slice);
-            let name_string = match name_os_string.into_string() {
-                Ok(string) => string,
-                Err(os_string) => os_string.to_string_lossy().into(),
-            };
-
-            // Clean up the property.
-            StructuredStorage::PropVariantClear(&mut property_value).ok();
-
-            Ok(name_string)
         }
     }
 
     fn id(&self) -> Result<DeviceId, DeviceIdError> {
         unsafe {
-            match self.device.GetId() {
-                Ok(pwstr) => match pwstr.to_string() {
-                    Ok(id_str) => Ok(DeviceId::WASAPI(id_str)),
-                    Err(e) => Err(DeviceIdError::BackendSpecific {
-                        err: BackendSpecificError {
-                            description: format!("Failed to convert device ID to string: {}", e),
-                        },
-                    }),
+            match &self.device {
+                DeviceInner::MMDevice(dev) => match dev.GetId() {
+                    Ok(pwstr) => match pwstr.to_string() {
+                        Ok(id_str) => Ok(DeviceId::WASAPI(id_str)),
+                        Err(e) => Err(DeviceIdError::BackendSpecific {
+                            err: BackendSpecificError {
+                                description: format!(
+                                    "Failed to convert device ID to string: {}",
+                                    e
+                                ),
+                            },
+                        }),
+                    },
+                    Err(e) => Err(DeviceIdError::BackendSpecific { err: e.into() }),
                 },
-                Err(e) => Err(DeviceIdError::BackendSpecific { err: e.into() }),
+                DeviceInner::ProcessCapture(proc) => Ok(DeviceId::WASAPI(format!("{proc:?}"))),
             }
         }
     }
@@ -357,13 +393,16 @@ impl Device {
     #[inline]
     fn from_immdevice(device: Audio::IMMDevice) -> Self {
         Device {
-            device,
+            device: DeviceInner::MMDevice(device),
             future_audio_client: Arc::new(Mutex::new(None)),
         }
     }
 
-    pub fn immdevice(&self) -> &Audio::IMMDevice {
-        &self.device
+    pub fn from_process_capture(pid: u32, capture_tree: bool) -> Self {
+        Device {
+            device: DeviceInner::ProcessCapture(ProcessCapture { pid, capture_tree }),
+            future_audio_client: Arc::new(Mutex::new(None)),
+        }
     }
 
     /// Ensures that `future_audio_client` contains a `Some` and returns a locked mutex to it.
@@ -376,9 +415,16 @@ impl Device {
         }
 
         let audio_client: Audio::IAudioClient = unsafe {
-            // can fail if the device has been disconnected since we enumerated it, or if
-            // the device doesn't support playback for some reason
-            self.device.Activate(Com::CLSCTX_ALL, None)?
+            match &self.device {
+                DeviceInner::MMDevice(dev) => {
+                    // can fail if the device has been disconnected since we enumerated it, or if
+                    // the device doesn't support playback for some reason
+                    dev.Activate(Com::CLSCTX_ALL, None)?
+                }
+                DeviceInner::ProcessCapture(proc) => {
+                    super::activate_async::capture_process(proc.pid, proc.capture_tree)?
+                }
+            }
         };
 
         if let Ok(c3) = audio_client.cast::<IAudioClient3>() {
@@ -554,8 +600,13 @@ impl Device {
     }
 
     pub(crate) fn data_flow(&self) -> Audio::EDataFlow {
-        let endpoint = Endpoint::from(self.device.clone());
-        endpoint.data_flow()
+        match &self.device {
+            DeviceInner::MMDevice(dev) => {
+                let endpoint = Endpoint::from(dev.clone());
+                endpoint.data_flow()
+            }
+            DeviceInner::ProcessCapture(_) => Audio::eCapture,
+        }
     }
 
     pub fn default_input_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
@@ -813,37 +864,9 @@ impl PartialEq for Device {
         // the client code might need to compare the previous default device with the current one.
         // The pointer comparison (`self.device == other.device`) don't work there,
         // because the pointers are different even when the default device stays the same.
-        //
-        // In this code section we're trying to use the GetId method for the device comparison, cf.
-        // https://docs.microsoft.com/en-us/windows/desktop/api/mmdeviceapi/nf-mmdeviceapi-immdevice-getid
-        unsafe {
-            struct IdRAII(windows::core::PWSTR);
-            /// RAII for device IDs.
-            impl Drop for IdRAII {
-                fn drop(&mut self) {
-                    unsafe { Com::CoTaskMemFree(Some(self.0 .0 as *mut _)) }
-                }
-            }
-            // GetId only fails with E_OUTOFMEMORY and if it does, we're probably dead already.
-            // Plus it won't do to change the device comparison logic unexpectedly.
-            let id1 = self.device.GetId().expect("cpal: GetId failure");
-            let id1 = IdRAII(id1);
-            let id2 = other.device.GetId().expect("cpal: GetId failure");
-            let id2 = IdRAII(id2);
-            // 16-bit null-terminated comparison.
-            let mut offset = 0;
-            loop {
-                let w1: u16 = *(id1.0).0.offset(offset);
-                let w2: u16 = *(id2.0).0.offset(offset);
-                if w1 == 0 && w2 == 0 {
-                    return true;
-                }
-                if w1 != w2 {
-                    return false;
-                }
-                offset += 1;
-            }
-        }
+        let id1 = self.id().expect("Failed to get id!");
+        let id2 = other.id().expect("Failed to get id!");
+        id1.eq(&id2)
     }
 }
 
@@ -1320,6 +1343,10 @@ impl BuildSource for Device {
             let mut stream_flags = Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
 
             if self.data_flow() == Audio::eRender {
+                stream_flags |= Audio::AUDCLNT_STREAMFLAGS_LOOPBACK;
+            }
+
+            if let DeviceInner::ProcessCapture(_) = &self.device {
                 stream_flags |= Audio::AUDCLNT_STREAMFLAGS_LOOPBACK;
             }
 

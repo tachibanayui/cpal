@@ -9,6 +9,7 @@ use crate::DevicesError;
 use std::io::Error as IoError;
 use windows::Win32::Media::Audio;
 
+mod activate_async;
 mod com;
 mod device;
 mod stream;
@@ -24,6 +25,10 @@ pub struct Host;
 impl Host {
     pub fn new() -> Result<Self, crate::HostUnavailable> {
         Ok(Host)
+    }
+
+    pub fn capture_process(&self, pid: u32, capture_tree: bool) -> Result<Device, DevicesError> {
+        Ok(Device::from_process_capture(pid, capture_tree))
     }
 }
 

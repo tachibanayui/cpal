@@ -308,6 +308,7 @@ impl EventHandle {
     pub fn inner(&self) -> Option<&windows::Win32::Foundation::HANDLE> {
         match self {
             Self::WASAPI(h) => Some(h),
+            #[allow(unreachable_patterns)]
             _ => None,
         }
     }
