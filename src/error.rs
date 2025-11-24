@@ -30,6 +30,14 @@ pub struct BackendSpecificError {
     pub description: String,
 }
 
+impl BackendSpecificError {
+    pub fn new(description: impl Into<String>) -> Self {
+        Self {
+            description: description.into(),
+        }
+    }
+}
+
 impl Display for BackendSpecificError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -311,6 +319,77 @@ impl Display for StreamError {
 impl Error for StreamError {}
 
 impl From<BackendSpecificError> for StreamError {
+    fn from(err: BackendSpecificError) -> Self {
+        Self::BackendSpecific { err }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum GetPeriodsError {
+    OperationNotSupported,
+    FormatNotSupported,
+    DeviceNotAvailable,
+    BackendSpecific { err: BackendSpecificError },
+}
+
+impl Display for GetPeriodsError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BackendSpecific { err } => err.fmt(f),
+            Self::FormatNotSupported => {
+                f.write_str("The requested device does not support the current format")
+            }
+            Self::OperationNotSupported => {
+                f.write_str("The requested device does not support querying periods")
+            }
+            Self::DeviceNotAvailable => f.write_str(
+                "The requested device is no longer available. For example, it has been unplugged.",
+            ),
+        }
+    }
+}
+
+impl Error for GetPeriodsError {}
+
+impl From<BackendSpecificError> for GetPeriodsError {
+    fn from(err: BackendSpecificError) -> Self {
+        Self::BackendSpecific { err }
+    }
+}
+
+pub type AnyError = Box<dyn Error + Send + Sync + 'static>;
+
+/// Similar to [`StreamError`] but for the [`Sink`] and [`Source`].
+#[derive(Debug)]
+pub enum SyncStreamError {
+    /// The device no longer exists. This can happen if the device is disconnected while the
+    /// program is running.
+    DeviceNotAvailable,
+    User(AnyError),
+    /// See the [`BackendSpecificError`] docs for more information about this error variant.
+    BackendSpecific {
+        err: BackendSpecificError,
+    },
+}
+
+impl Display for SyncStreamError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BackendSpecific { err } => err.fmt(f),
+            Self::DeviceNotAvailable => f.write_str(
+                "The requested device is no longer available. For example, it has been unplugged.",
+            ),
+            Self::User(err) => {
+                f.write_str("Error originated from user: ")?;
+                err.fmt(f)
+            }
+        }
+    }
+}
+
+impl Error for SyncStreamError {}
+
+impl From<BackendSpecificError> for SyncStreamError {
     fn from(err: BackendSpecificError) -> Self {
         Self::BackendSpecific { err }
     }

@@ -90,6 +90,18 @@ impl ErrDeviceNotAvailable for crate::StreamError {
     }
 }
 
+impl ErrDeviceNotAvailable for crate::GetPeriodsError {
+    fn device_not_available() -> Self {
+        Self::DeviceNotAvailable
+    }
+}
+
+impl ErrDeviceNotAvailable for crate::SyncStreamError {
+    fn device_not_available() -> Self {
+        Self::DeviceNotAvailable
+    }
+}
+
 fn windows_err_to_cpal_err<E: ErrDeviceNotAvailable>(e: windows::core::Error) -> E {
     windows_err_to_cpal_err_message::<E>(e, "")
 }

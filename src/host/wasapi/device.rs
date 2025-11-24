@@ -1,13 +1,14 @@
 use crate::traits::{
-    BuildSink, BuildSource, Captures, EventHandle, Period, Periodcity, Renders, Sink, Source,
+    AfterCapture, AfterRender, BuildSink, BuildSource, Captures, EventHandle, Period, Periodcity,
+    Renders, Sink, Source,
 };
-use crate::FrameCount;
 use crate::{
-    BackendSpecificError, BufferSize, Data, DefaultStreamConfigError, DeviceId, DeviceIdError,
-    DeviceNameError, DevicesError, InputCallbackInfo, OutputCallbackInfo, SampleFormat, SampleRate,
-    StreamConfig, SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange,
-    SupportedStreamConfigsError, COMMON_SAMPLE_RATES,
+    AnyError, BackendSpecificError, BufferSize, Data, DefaultStreamConfigError, DeviceId,
+    DeviceIdError, DeviceNameError, DevicesError, InputCallbackInfo, OutputCallbackInfo,
+    SampleFormat, SampleRate, StreamConfig, SupportedBufferSize, SupportedStreamConfig,
+    SupportedStreamConfigRange, SupportedStreamConfigsError, SyncStreamError, COMMON_SAMPLE_RATES,
 };
+use crate::{FrameCount, GetPeriodsError};
 use std::ffi::OsString;
 use std::fmt;
 use std::mem;
@@ -44,7 +45,7 @@ pub type SupportedInputConfigs = std::vec::IntoIter<SupportedStreamConfigRange>;
 pub type SupportedOutputConfigs = std::vec::IntoIter<SupportedStreamConfigRange>;
 
 /// Wrapper because of that stupid decision to remove `Send` and `Sync` from raw pointers.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct IAudioClientWrapper(Audio::IAudioClient);
 unsafe impl Send for IAudioClientWrapper {}
 unsafe impl Sync for IAudioClientWrapper {}
@@ -1093,16 +1094,13 @@ fn buffer_duration_to_frames(buffer_duration: i64, sample_rate: u32) -> FrameCou
 }
 
 impl Periodcity for Device {
-    fn get_periods(
-        &self,
-        cfg: &SupportedStreamConfig,
-    ) -> Result<Period, Box<dyn std::error::Error>> {
+    fn get_periods(&self, cfg: &SupportedStreamConfig) -> Result<Period, GetPeriodsError> {
         com::com_initialized();
         // Retrieve the `IAudioClient`.
         let lock = match self.ensure_future_audio_client() {
             Ok(lock) => lock,
             Err(ref e) if e.code() == Audio::AUDCLNT_E_DEVICE_INVALIDATED => {
-                return Err(SupportedStreamConfigsError::DeviceNotAvailable)?
+                return Err(GetPeriodsError::DeviceNotAvailable)?
             }
             Err(e) => {
                 let description = format!("{}", e);
@@ -1115,11 +1113,16 @@ impl Periodcity for Device {
         unsafe {
             let c3: IAudioClient3 = match client.cast() {
                 Ok(o) => o,
-                Err(_) => return Err("This device does not support querying periods!")?,
+                Err(_) => return Err(GetPeriodsError::OperationNotSupported)?,
             };
 
-            let wfx = config_to_waveformatextensible(&cfg.config(), cfg.sample_format())
-                .ok_or("could not create a `cpal::SupportedStreamConfig` from a `WAVEFORMATEX`")?;
+            let wfx =
+                config_to_waveformatextensible(&cfg.config(), cfg.sample_format())
+                    .ok_or(GetPeriodsError::BackendSpecific {
+                    err: BackendSpecificError::new(
+                        "could not create a `cpal::SupportedStreamConfig` from a `WAVEFORMATEX`",
+                    ),
+                })?;
 
             let mut default_period = 0;
             let mut fundamental_period = 0;
@@ -1132,7 +1135,13 @@ impl Periodcity for Device {
                 &mut fundamental_period,
                 &mut min_period,
                 &mut max_period,
-            )?;
+            )
+            .map_err(|e| {
+                windows_err_to_cpal_err_message::<GetPeriodsError>(
+                    e,
+                    "GetSharedModeEnginePeriod failed: ",
+                )
+            })?;
 
             return Ok(Period {
                 default: default_period as usize,
@@ -1153,21 +1162,45 @@ pub struct WASAPISink {
 impl Sink for WASAPISink {
     fn render(
         &mut self,
-        f: &mut dyn FnMut(Renders<'_>) -> usize,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+        f: &mut dyn FnMut(Renders<'_>) -> Result<usize, AnyError>,
+    ) -> Result<AfterRender, SyncStreamError> {
         unsafe {
-            let padding = self.client.0.GetCurrentPadding()?;
+            let padding = self.client.0.GetCurrentPadding().map_err(|e| {
+                windows_err_to_cpal_err_message::<SyncStreamError>(
+                    e,
+                    "Failed to get stream padding: ",
+                )
+            })?;
             let available = self.buf_size - padding;
-            if available < 10 {
-                f(Renders { data: &mut [] });
-                return Ok(());
+            if available == 0 {
+                f(Renders { data: &mut [] }).map_err(|e| SyncStreamError::User(e))?;
+                return Ok(AfterRender {
+                    available_next: Some(0),
+                });
             }
 
-            let cbuf = self.render.GetBuffer(available)?;
+            let cbuf = self.render.GetBuffer(available).map_err(|e| {
+                windows_err_to_cpal_err_message::<SyncStreamError>(
+                    e,
+                    "Failed to get stream buffer: ",
+                )
+            })?;
             let mut rbuf = slice::from_raw_parts_mut(cbuf, available as usize * self.block);
-            let frames = f(Renders { data: &mut rbuf });
-            self.render.ReleaseBuffer(frames as u32, 0)?;
-            return Ok(());
+            let frames = f(Renders { data: &mut rbuf }).map_err(|e| SyncStreamError::User(e))?;
+            self.render.ReleaseBuffer(frames as u32, 0).map_err(|e| {
+                windows_err_to_cpal_err_message::<SyncStreamError>(
+                    e,
+                    "Failed to release stream buffer: ",
+                )
+            })?;
+            return Ok(AfterRender {
+                available_next: Some(self.client.0.GetCurrentPadding().map_err(|e| {
+                    windows_err_to_cpal_err_message::<SyncStreamError>(
+                        e,
+                        "Failed to get stream padding: ",
+                    )
+                })? as _),
+            });
         }
     }
 }
@@ -1273,37 +1306,63 @@ impl BuildSink for Device {
     }
 }
 
+#[derive(Debug)]
 pub struct WASAPISource {
-    client: IAudioClientWrapper,
+    // client: IAudioClientWrapper,
     capture: IAudioCaptureClient,
-    buf_size: u32,
+    // buf_size: u32,
     block: usize,
 }
 
 impl Source for WASAPISource {
     fn capture(
         &mut self,
-        f: &mut dyn FnMut(Captures<'_>) -> usize,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+        f: &mut dyn FnMut(Captures<'_>) -> Result<usize, AnyError>,
+    ) -> Result<AfterCapture, SyncStreamError> {
         unsafe {
             let mut cbuf = ptr::null_mut();
             let mut ftr = 0;
             let mut flags = 0;
             self.capture
-                .GetBuffer(&mut cbuf, &mut ftr, &mut flags, None, None)?;
+                .GetBuffer(&mut cbuf, &mut ftr, &mut flags, None, None)
+                .map_err(|e| {
+                    windows_err_to_cpal_err_message::<SyncStreamError>(
+                        e,
+                        "Failed to get stream buffer: ",
+                    )
+                })?;
             if flags != 0 {
                 println!("Capture flag not 0: {flags}");
             }
             if cbuf.is_null() || ftr == 0 {
-                f(Captures { data: &[] });
-                self.capture.ReleaseBuffer(0)?;
-                return Ok(());
+                f(Captures { data: &[] }).map_err(|e| SyncStreamError::User(e))?;
+                self.capture.ReleaseBuffer(0).map_err(|e| {
+                    windows_err_to_cpal_err_message::<SyncStreamError>(
+                        e,
+                        "Failed to release stream buffer: ",
+                    )
+                })?;
+                return Ok(AfterCapture {
+                    available_next: Some(0),
+                });
             }
 
             let rbuf = slice::from_raw_parts(cbuf, ftr as usize * self.block);
-            let frames = f(Captures { data: &rbuf });
-            self.capture.ReleaseBuffer(frames as u32)?;
-            return Ok(());
+            let frames = f(Captures { data: &rbuf }).map_err(|e| SyncStreamError::User(e))?;
+            self.capture.ReleaseBuffer(frames as u32).map_err(|e| {
+                windows_err_to_cpal_err_message::<SyncStreamError>(
+                    e,
+                    "Failed to release stream buffer: ",
+                )
+            })?;
+            return Ok(AfterCapture {
+                available_next: Some(self.capture.GetNextPacketSize().map_err(|e| {
+                    windows_err_to_cpal_err_message::<SyncStreamError>(
+                        e,
+                        "Failed to release stream buffer: ",
+                    )
+                })? as _),
+            });
         }
     }
 }
@@ -1402,9 +1461,9 @@ impl BuildSource for Device {
             };
 
             // obtaining the size of the samples buffer in number of frames
-            let max_frames_in_buffer = audio_client
-                .GetBufferSize()
-                .map_err(windows_err_to_cpal_err::<BuildStreamError>)?;
+            // let max_frames_in_buffer = audio_client
+            //     .GetBufferSize()
+            //     .map_err(windows_err_to_cpal_err::<BuildStreamError>)?;
 
             // Creating the event that will be signalled whenever we need to submit some samples.
             let ev = *ev.inner().unwrap();
@@ -1432,9 +1491,9 @@ impl BuildSource for Device {
                 )
             })?;
             Ok(WASAPISource {
-                client: IAudioClientWrapper(audio_client),
+                // client: IAudioClientWrapper(audio_client),
                 capture: capture_client,
-                buf_size: max_frames_in_buffer,
+                // buf_size: max_frames_in_buffer,
                 block: waveformatex.nBlockAlign as _,
             })
         }

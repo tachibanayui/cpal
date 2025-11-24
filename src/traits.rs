@@ -3,10 +3,11 @@
 use std::time::Duration;
 
 use crate::{
-    BuildStreamError, Data, DefaultStreamConfigError, DeviceId, DeviceIdError, DeviceNameError,
-    DevicesError, InputCallbackInfo, InputDevices, OutputCallbackInfo, OutputDevices,
-    PauseStreamError, PlayStreamError, SampleFormat, SizedSample, StreamConfig, StreamError,
-    SupportedStreamConfig, SupportedStreamConfigRange, SupportedStreamConfigsError,
+    AnyError, BuildStreamError, Data, DefaultStreamConfigError, DeviceId, DeviceIdError,
+    DeviceNameError, DevicesError, GetPeriodsError, InputCallbackInfo, InputDevices,
+    OutputCallbackInfo, OutputDevices, PauseStreamError, PlayStreamError, SampleFormat,
+    SizedSample, StreamConfig, StreamError, SupportedStreamConfig, SupportedStreamConfigRange,
+    SupportedStreamConfigsError, SyncStreamError,
 };
 
 /// A [`Host`] provides access to the available audio devices on the system.
@@ -236,24 +237,46 @@ pub trait StreamTrait {
 
 pub struct Captures<'a> {
     pub data: &'a [u8],
+    // todo monotonic clocks
 }
 
 pub struct Renders<'a> {
     pub data: &'a mut [u8],
+    // todo monotonic clocks
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+pub struct AfterCapture {
+    /// Number of frame still available for capture after a capture pass
+    /// Consumer can do another pass instead of wait for event to save
+    /// a few thread context switches
+    ///
+    /// None means the current device does not support querying this info
+    pub available_next: Option<usize>,
 }
 
 pub trait Source {
     fn capture(
         &mut self,
-        f: &mut dyn FnMut(Captures<'_>) -> usize,
-    ) -> Result<(), Box<dyn std::error::Error>>;
+        f: &mut dyn FnMut(Captures<'_>) -> Result<usize, AnyError>,
+    ) -> Result<AfterCapture, SyncStreamError>;
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+pub struct AfterRender {
+    /// Number of frame still available for capture after a capture pass
+    /// Consumer can do another pass instead of wait for event to save
+    /// a few thread context switches
+    ///
+    /// None means the current device does not support querying this info
+    pub available_next: Option<usize>,
 }
 
 pub trait Sink {
     fn render(
         &mut self,
-        f: &mut dyn FnMut(Renders<'_>) -> usize,
-    ) -> Result<(), Box<dyn std::error::Error>>;
+        f: &mut dyn FnMut(Renders<'_>) -> Result<usize, AnyError>,
+    ) -> Result<AfterRender, SyncStreamError>;
 }
 
 pub trait BuildSource {
@@ -286,10 +309,7 @@ pub struct Period {
 }
 
 pub trait Periodcity {
-    fn get_periods(
-        &self,
-        cfg: &SupportedStreamConfig,
-    ) -> Result<Period, Box<dyn std::error::Error>>;
+    fn get_periods(&self, cfg: &SupportedStreamConfig) -> Result<Period, GetPeriodsError>;
 }
 
 pub enum EventHandle {
