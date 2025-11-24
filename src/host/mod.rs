@@ -24,7 +24,7 @@ pub(crate) mod emscripten;
 ))]
 pub(crate) mod jack;
 #[cfg(windows)]
-pub(crate) mod wasapi;
+pub mod wasapi;
 #[cfg(all(
     target_arch = "wasm32",
     feature = "wasm-bindgen",

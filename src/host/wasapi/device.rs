@@ -1,3 +1,7 @@
+use crate::traits::{
+    BuildSink, BuildSource, Captures, EventHandle, HostTrait, Period, Periodcity, Renders, Sink,
+    Source,
+};
 use crate::FrameCount;
 use crate::{
     BackendSpecificError, BufferSize, Data, DefaultStreamConfigError, DeviceId, DeviceIdError,
@@ -21,7 +25,10 @@ use windows::core::Interface;
 use windows::core::GUID;
 use windows::Win32::Devices::Properties;
 use windows::Win32::Foundation;
-use windows::Win32::Media::Audio::IAudioRenderClient;
+use windows::Win32::Media::Audio::{
+    AudioCategory_Media, AudioClientProperties, IAudioCaptureClient, IAudioClient3,
+    IAudioRenderClient, WAVEFORMATEX,
+};
 use windows::Win32::Media::{Audio, KernelStreaming, Multimedia};
 use windows::Win32::System::Com;
 use windows::Win32::System::Com::{StructuredStorage, STGM_READ};
@@ -39,6 +46,11 @@ pub type SupportedOutputConfigs = std::vec::IntoIter<SupportedStreamConfigRange>
 struct IAudioClientWrapper(Audio::IAudioClient);
 unsafe impl Send for IAudioClientWrapper {}
 unsafe impl Sync for IAudioClientWrapper {}
+
+pub enum DeviceInner {
+    MMDevice(Audio::IMMDevice),
+    ProcessCapture(u32),
+}
 
 /// An opaque type that identifies an end point.
 #[derive(Clone)]
@@ -368,6 +380,13 @@ impl Device {
             // the device doesn't support playback for some reason
             self.device.Activate(Com::CLSCTX_ALL, None)?
         };
+
+        if let Ok(c3) = audio_client.cast::<IAudioClient3>() {
+            let mut props = AudioClientProperties::default();
+            props.cbSize = mem::size_of_val(&props) as u32;
+            props.eCategory = AudioCategory_Media;
+            unsafe { c3.SetClientProperties(&props)? };
+        }
 
         *lock = Some(IAudioClientWrapper(audio_client));
         Ok(lock)
@@ -1048,4 +1067,349 @@ fn buffer_size_to_duration(buffer_size: &BufferSize, sample_rate: u32) -> i64 {
 
 fn buffer_duration_to_frames(buffer_duration: i64, sample_rate: u32) -> FrameCount {
     (buffer_duration * sample_rate as i64 * 100 / 1_000_000_000) as FrameCount
+}
+
+impl Periodcity for Device {
+    fn get_periods(
+        &self,
+        cfg: &SupportedStreamConfig,
+    ) -> Result<Period, Box<dyn std::error::Error>> {
+        com::com_initialized();
+        // Retrieve the `IAudioClient`.
+        let lock = match self.ensure_future_audio_client() {
+            Ok(lock) => lock,
+            Err(ref e) if e.code() == Audio::AUDCLNT_E_DEVICE_INVALIDATED => {
+                return Err(SupportedStreamConfigsError::DeviceNotAvailable)?
+            }
+            Err(e) => {
+                let description = format!("{}", e);
+                let err = BackendSpecificError { description };
+                return Err(err.into());
+            }
+        };
+        let client = &lock.as_ref().unwrap().0;
+
+        unsafe {
+            let c3: IAudioClient3 = match client.cast() {
+                Ok(o) => o,
+                Err(_) => return Err("This device does not support querying periods!")?,
+            };
+
+            let wfx = config_to_waveformatextensible(&cfg.config(), cfg.sample_format())
+                .ok_or("could not create a `cpal::SupportedStreamConfig` from a `WAVEFORMATEX`")?;
+
+            let mut default_period = 0;
+            let mut fundamental_period = 0;
+            let mut min_period = 0;
+            let mut max_period = 0;
+
+            c3.GetSharedModeEnginePeriod(
+                &wfx as *const _ as *const WAVEFORMATEX,
+                &mut default_period,
+                &mut fundamental_period,
+                &mut min_period,
+                &mut max_period,
+            )?;
+
+            return Ok(Period {
+                default: default_period as usize,
+                max: max_period as usize,
+                min: min_period as usize,
+            });
+        }
+    }
+}
+
+pub struct WASAPISink {
+    client: IAudioClientWrapper,
+    render: IAudioRenderClient,
+    buf_size: u32,
+    block: usize,
+}
+
+impl Sink for WASAPISink {
+    fn render(
+        &mut self,
+        f: &mut dyn FnMut(Renders<'_>) -> usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        unsafe {
+            let padding = self.client.0.GetCurrentPadding()?;
+            let available = self.buf_size - padding;
+            if available < 10 {
+                f(Renders { data: &mut [] });
+                return Ok(());
+            }
+
+            let cbuf = self.render.GetBuffer(available)?;
+            let mut rbuf = slice::from_raw_parts_mut(cbuf, available as usize * self.block);
+            let frames = f(Renders { data: &mut rbuf });
+            self.render.ReleaseBuffer(frames as u32, 0)?;
+            return Ok(());
+        }
+    }
+}
+
+impl BuildSink for Device {
+    type Output = WASAPISink;
+
+    fn build_sink(
+        &mut self,
+        cfg: StreamConfig,
+        fmt: SampleFormat,
+        period: usize,
+        ev: EventHandle,
+    ) -> Result<Self::Output, BuildStreamError> {
+        com::com_initialized();
+        // Retrieve the `IAudioClient`.
+        let client = self
+            .build_audioclient()
+            .map_err(windows_err_to_cpal_err::<BuildStreamError>)?;
+        unsafe {
+            // Note: Buffer size validation is not needed here - `IAudioClient::Initialize`
+            // will return `AUDCLNT_E_BUFFER_SIZE_ERROR` if the buffer size is not supported.
+            let buffer_duration = buffer_size_to_duration(&cfg.buffer_size, cfg.sample_rate.0);
+
+            let waveformatex = {
+                let format_attempt = config_to_waveformatextensible(&cfg, fmt)
+                    .ok_or(BuildStreamError::StreamConfigNotSupported)?;
+                let share_mode = Audio::AUDCLNT_SHAREMODE_SHARED;
+
+                // Ensure the format is supported.
+                match super::device::is_format_supported(&client, &format_attempt.Format) {
+                    Ok(false) => return Err(BuildStreamError::StreamConfigNotSupported)?,
+                    Err(_) => return Err(BuildStreamError::DeviceNotAvailable)?,
+                    _ => (),
+                }
+
+                match client.cast::<IAudioClient3>() {
+                    Ok(c3) => {
+                        // client supports request lower period
+                        c3.InitializeSharedAudioStream(
+                            Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                            period as _,
+                            &format_attempt.Format,
+                            None,
+                        )
+                        .map_err(windows_err_to_cpal_err::<BuildStreamError>)?;
+                    }
+                    Err(_) => {
+                        // Finally, initializing the audio client
+                        client
+                            .Initialize(
+                                share_mode,
+                                Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                buffer_duration,
+                                0,
+                                &format_attempt.Format,
+                                None,
+                            )
+                            .map_err(windows_err_to_cpal_err::<BuildStreamError>)?;
+                    }
+                };
+
+                format_attempt.Format
+            };
+
+            // obtaining the size of the samples buffer in number of frames
+            let max_frames_in_buffer = client.GetBufferSize().map_err(|e| {
+                windows_err_to_cpal_err_message::<BuildStreamError>(
+                    e,
+                    "failed to obtain buffer size: ",
+                )
+            })?;
+
+            let ev = *ev.inner().unwrap();
+            if let Err(e) = client.SetEventHandle(ev) {
+                let description = format!("failed to call SetEventHandle: {}", e);
+                let err = BackendSpecificError { description };
+                return Err(err.into());
+            }
+
+            // Building a `IAudioRenderClient` that will be used to fill the samples buffer.
+            let render_client = client.GetService::<IAudioRenderClient>().map_err(|e| {
+                windows_err_to_cpal_err_message::<BuildStreamError>(
+                    e,
+                    "failed to build render client: ",
+                )
+            })?;
+
+            // let audio_clock = get_audio_clock(&audio_client)?;
+            client.Start().map_err(|e| {
+                windows_err_to_cpal_err_message::<BuildStreamError>(
+                    e,
+                    "failed to obtain buffer size: ",
+                )
+            })?;
+            Ok(WASAPISink {
+                client: IAudioClientWrapper(client),
+                render: render_client,
+                buf_size: max_frames_in_buffer,
+                block: waveformatex.nBlockAlign as _,
+            })
+        }
+    }
+}
+
+pub struct WASAPISource {
+    client: IAudioClientWrapper,
+    capture: IAudioCaptureClient,
+    buf_size: u32,
+    block: usize,
+}
+
+impl Source for WASAPISource {
+    fn capture(
+        &mut self,
+        f: &mut dyn FnMut(Captures<'_>) -> usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        unsafe {
+            let mut cbuf = ptr::null_mut();
+            let mut ftr = 0;
+            let mut flags = 0;
+            self.capture
+                .GetBuffer(&mut cbuf, &mut ftr, &mut flags, None, None)?;
+            if flags != 0 {
+                println!("Capture flag not 0: {flags}");
+            }
+            if cbuf.is_null() || ftr == 0 {
+                f(Captures { data: &[] });
+                self.capture.ReleaseBuffer(0)?;
+                return Ok(());
+            }
+
+            let rbuf = slice::from_raw_parts(cbuf, ftr as usize * self.block);
+            let frames = f(Captures { data: &rbuf });
+            self.capture.ReleaseBuffer(frames as u32)?;
+            return Ok(());
+        }
+    }
+}
+
+impl BuildSource for Device {
+    type Output = WASAPISource;
+
+    fn build_source(
+        &mut self,
+        cfg: StreamConfig,
+        fmt: SampleFormat,
+        period: usize,
+        ev: EventHandle,
+    ) -> Result<Self::Output, BuildStreamError> {
+        unsafe {
+            // Making sure that COM is initialized.
+            // It's not actually sure that this is required, but when in doubt do it.
+            com::com_initialized();
+
+            // Obtaining a `IAudioClient`.
+            let audio_client = match self.build_audioclient() {
+                Ok(client) => client,
+                Err(ref e) if e.code() == Audio::AUDCLNT_E_DEVICE_INVALIDATED => {
+                    return Err(BuildStreamError::DeviceNotAvailable)
+                }
+                Err(e) => {
+                    let description = format!("{}", e);
+                    let err = BackendSpecificError { description };
+                    return Err(err.into());
+                }
+            };
+
+            // Note: Buffer size validation is not needed here - `IAudioClient::Initialize`
+            // will return `AUDCLNT_E_BUFFER_SIZE_ERROR` if the buffer size is not supported.
+            let buffer_duration = buffer_size_to_duration(&cfg.buffer_size, cfg.sample_rate.0);
+
+            let mut stream_flags = Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+
+            if self.data_flow() == Audio::eRender {
+                stream_flags |= Audio::AUDCLNT_STREAMFLAGS_LOOPBACK;
+            }
+
+            // Computing the format and initializing the device.
+            let waveformatex = {
+                let format_attempt = config_to_waveformatextensible(&cfg, fmt)
+                    .ok_or(BuildStreamError::StreamConfigNotSupported)?;
+                let share_mode = Audio::AUDCLNT_SHAREMODE_SHARED;
+
+                // Ensure the format is supported.
+                match super::device::is_format_supported(&audio_client, &format_attempt.Format) {
+                    Ok(false) => return Err(BuildStreamError::StreamConfigNotSupported),
+                    Err(_) => return Err(BuildStreamError::DeviceNotAvailable),
+                    _ => (),
+                }
+
+                let hresult = match audio_client.cast::<IAudioClient3>() {
+                    Ok(c3) => {
+                        // client supports request lower period
+                        c3.InitializeSharedAudioStream(
+                            stream_flags,
+                            period as _,
+                            &format_attempt.Format,
+                            None,
+                        )
+                    }
+                    Err(_) => {
+                        // Finally, initializing the audio client
+                        audio_client.Initialize(
+                            share_mode,
+                            stream_flags,
+                            buffer_duration,
+                            0,
+                            &format_attempt.Format,
+                            None,
+                        )
+                    }
+                };
+
+                match hresult {
+                    Err(ref e) if e.code() == Audio::AUDCLNT_E_DEVICE_INVALIDATED => {
+                        return Err(BuildStreamError::DeviceNotAvailable);
+                    }
+                    Err(e) => {
+                        let description = format!("{}", e);
+                        let err = BackendSpecificError { description };
+                        return Err(err.into());
+                    }
+                    Ok(()) => (),
+                };
+
+                format_attempt.Format
+            };
+
+            // obtaining the size of the samples buffer in number of frames
+            let max_frames_in_buffer = audio_client
+                .GetBufferSize()
+                .map_err(windows_err_to_cpal_err::<BuildStreamError>)?;
+
+            // Creating the event that will be signalled whenever we need to submit some samples.
+            let ev = *ev.inner().unwrap();
+            if let Err(e) = audio_client.SetEventHandle(ev) {
+                let description = format!("failed to call SetEventHandle: {}", e);
+                let err = BackendSpecificError { description };
+                return Err(err.into());
+            }
+
+            // Building a `IAudioCaptureClient` that will be used to read captured samples.
+            let capture_client = audio_client
+                .GetService::<Audio::IAudioCaptureClient>()
+                .map_err(|e| {
+                    windows_err_to_cpal_err_message::<BuildStreamError>(
+                        e,
+                        "failed to build capture client: ",
+                    )
+                })?;
+
+            // let audio_clock = get_audio_clock(&audio_client)?;
+            audio_client.Start().map_err(|e| {
+                windows_err_to_cpal_err_message::<BuildStreamError>(
+                    e,
+                    "failed to obtain buffer size: ",
+                )
+            })?;
+            Ok(WASAPISource {
+                client: IAudioClientWrapper(audio_client),
+                capture: capture_client,
+                buf_size: max_frames_in_buffer,
+                block: waveformatex.nBlockAlign as _,
+            })
+        }
+    }
 }

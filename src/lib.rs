@@ -177,7 +177,7 @@ use std::time::Duration;
 use wasm_bindgen::prelude::*;
 
 mod error;
-mod host;
+pub mod host;
 pub mod platform;
 mod samples_formats;
 pub mod traits;
@@ -508,6 +508,10 @@ impl SupportedStreamConfig {
             sample_rate: self.sample_rate,
             buffer_size: BufferSize::Default,
         }
+    }
+
+    pub fn frame_size(&self) -> usize {
+        self.sample_format().sample_size() as usize * self.channels() as usize
     }
 }
 

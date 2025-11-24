@@ -233,3 +233,82 @@ pub trait StreamTrait {
     /// fail in these cases.
     fn pause(&self) -> Result<(), PauseStreamError>;
 }
+
+pub struct Captures<'a> {
+    pub data: &'a [u8],
+}
+
+pub struct Renders<'a> {
+    pub data: &'a mut [u8],
+}
+
+pub trait Source {
+    fn capture(
+        &mut self,
+        f: &mut dyn FnMut(Captures<'_>) -> usize,
+    ) -> Result<(), Box<dyn std::error::Error>>;
+}
+
+pub trait Sink {
+    fn render(
+        &mut self,
+        f: &mut dyn FnMut(Renders<'_>) -> usize,
+    ) -> Result<(), Box<dyn std::error::Error>>;
+}
+
+pub trait BuildSource {
+    type Output: Source;
+    fn build_source(
+        &mut self,
+        cfg: StreamConfig,
+        fmt: SampleFormat,
+        period: usize,
+        ev: EventHandle,
+    ) -> Result<Self::Output, BuildStreamError>;
+}
+
+pub trait BuildSink {
+    type Output: Sink;
+    fn build_sink(
+        &mut self,
+        cfg: StreamConfig,
+        fmt: SampleFormat,
+        period: usize,
+        ev: EventHandle,
+    ) -> Result<Self::Output, BuildStreamError>;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Period {
+    pub default: usize,
+    pub min: usize,
+    pub max: usize,
+}
+
+pub trait Periodcity {
+    fn get_periods(
+        &self,
+        cfg: &SupportedStreamConfig,
+    ) -> Result<Period, Box<dyn std::error::Error>>;
+}
+
+pub enum EventHandle {
+    #[cfg(windows)]
+    WASAPI(windows::Win32::Foundation::HANDLE),
+}
+
+impl From<windows::Win32::Foundation::HANDLE> for EventHandle {
+    fn from(value: windows::Win32::Foundation::HANDLE) -> Self {
+        Self::WASAPI(value)
+    }
+}
+
+impl EventHandle {
+    #[cfg(windows)]
+    pub fn inner(&self) -> Option<&windows::Win32::Foundation::HANDLE> {
+        match self {
+            Self::WASAPI(h) => Some(h),
+            _ => None,
+        }
+    }
+}
