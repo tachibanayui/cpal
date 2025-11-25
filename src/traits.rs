@@ -236,12 +236,12 @@ pub trait StreamTrait {
 }
 
 pub struct Captures<'a> {
-    pub data: &'a [u8],
+    pub data: &'a Data,
     // todo monotonic clocks
 }
 
 pub struct Renders<'a> {
-    pub data: &'a mut [u8],
+    pub data: &'a mut Data,
     // todo monotonic clocks
 }
 
@@ -253,13 +253,24 @@ pub struct AfterCapture {
     ///
     /// None means the current device does not support querying this info
     pub available_next: Option<usize>,
+
+    /// Did the current call to render/capture trigger callback?
+    /// Streams may skip calling the closure if there is nothing in the buffer
+    pub callback_triggered: bool,
 }
 
 pub trait Source {
+    /// Closure return number of bytes captured. Note that some Source may not support partial capture
+    /// See: [`permits_partial_capture`] for more info
     fn capture(
         &mut self,
         f: &mut dyn FnMut(Captures<'_>) -> Result<usize, AnyError>,
     ) -> Result<AfterCapture, SyncStreamError>;
+
+    /// Determine if consumer can capture buffer partially
+    /// if a source doesn't permit partial capture, consumers must either
+    /// consume all buffer or none of it
+    fn permits_partial_capture(&self) -> bool;
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -270,6 +281,10 @@ pub struct AfterRender {
     ///
     /// None means the current device does not support querying this info
     pub available_next: Option<usize>,
+
+    /// Did the current call to render/capture trigger callback?
+    /// Streams may skip calling the closure if there is nothing in the buffer
+    pub callback_triggered: bool,
 }
 
 pub trait Sink {
@@ -281,11 +296,12 @@ pub trait Sink {
 
 pub trait BuildSource {
     type Output: Source;
+
     fn build_source(
         &mut self,
         cfg: StreamConfig,
         fmt: SampleFormat,
-        period: usize,
+        period: PeriocityRequest,
         ev: EventHandle,
     ) -> Result<Self::Output, BuildStreamError>;
 }
@@ -296,9 +312,16 @@ pub trait BuildSink {
         &mut self,
         cfg: StreamConfig,
         fmt: SampleFormat,
-        period: usize,
+        period: PeriocityRequest,
         ev: EventHandle,
     ) -> Result<Self::Output, BuildStreamError>;
+}
+
+pub enum PeriocityRequest {
+    // Using the host's default setting
+    Default,
+    LowestPossible,
+    Approximate(usize),
 }
 
 #[derive(Debug, Default, Clone, Copy)]

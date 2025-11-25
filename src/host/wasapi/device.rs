@@ -1,6 +1,6 @@
 use crate::traits::{
-    AfterCapture, AfterRender, BuildSink, BuildSource, Captures, EventHandle, Period, Periodcity,
-    Renders, Sink, Source,
+    AfterCapture, AfterRender, BuildSink, BuildSource, Captures, EventHandle, PeriocityRequest,
+    Period, Periodcity, Renders, Sink, Source,
 };
 use crate::{
     AnyError, BackendSpecificError, BufferSize, Data, DefaultStreamConfigError, DeviceId,
@@ -1156,7 +1156,9 @@ pub struct WASAPISink {
     client: IAudioClientWrapper,
     render: IAudioRenderClient,
     buf_size: u32,
-    block: usize,
+    // block: usize,
+    fmt: SampleFormat,
+    cfg: StreamConfig,
 }
 
 impl Sink for WASAPISink {
@@ -1173,9 +1175,9 @@ impl Sink for WASAPISink {
             })?;
             let available = self.buf_size - padding;
             if available == 0 {
-                f(Renders { data: &mut [] }).map_err(|e| SyncStreamError::User(e))?;
                 return Ok(AfterRender {
                     available_next: Some(0),
+                    callback_triggered: false,
                 });
             }
 
@@ -1185,8 +1187,14 @@ impl Sink for WASAPISink {
                     "Failed to get stream buffer: ",
                 )
             })?;
-            let mut rbuf = slice::from_raw_parts_mut(cbuf, available as usize * self.block);
-            let frames = f(Renders { data: &mut rbuf }).map_err(|e| SyncStreamError::User(e))?;
+            let frames = f(Renders {
+                data: &mut Data::from_parts(
+                    cbuf as _,
+                    available as usize * self.cfg.channels as usize,
+                    self.fmt,
+                ),
+            })
+            .map_err(|e| SyncStreamError::User(e))?;
             self.render.ReleaseBuffer(frames as u32, 0).map_err(|e| {
                 windows_err_to_cpal_err_message::<SyncStreamError>(
                     e,
@@ -1194,6 +1202,7 @@ impl Sink for WASAPISink {
                 )
             })?;
             return Ok(AfterRender {
+                callback_triggered: true,
                 available_next: Some(self.client.0.GetCurrentPadding().map_err(|e| {
                     windows_err_to_cpal_err_message::<SyncStreamError>(
                         e,
@@ -1212,7 +1221,7 @@ impl BuildSink for Device {
         &mut self,
         cfg: StreamConfig,
         fmt: SampleFormat,
-        period: usize,
+        period: PeriocityRequest,
         ev: EventHandle,
     ) -> Result<Self::Output, BuildStreamError> {
         com::com_initialized();
@@ -1225,7 +1234,8 @@ impl BuildSink for Device {
             // will return `AUDCLNT_E_BUFFER_SIZE_ERROR` if the buffer size is not supported.
             let buffer_duration = buffer_size_to_duration(&cfg.buffer_size, cfg.sample_rate.0);
 
-            let waveformatex = {
+            // let waveformatex = {
+            let _ = {
                 let format_attempt = config_to_waveformatextensible(&cfg, fmt)
                     .ok_or(BuildStreamError::StreamConfigNotSupported)?;
                 let share_mode = Audio::AUDCLNT_SHAREMODE_SHARED;
@@ -1239,6 +1249,38 @@ impl BuildSink for Device {
 
                 match client.cast::<IAudioClient3>() {
                     Ok(c3) => {
+                        let period = if let PeriocityRequest::Approximate(p) = period {
+                            p
+                        } else {
+                            let supported = SupportedStreamConfig::new(
+                                cfg.channels,
+                                cfg.sample_rate,
+                                SupportedBufferSize::Unknown,
+                                fmt,
+                            );
+                            match self.get_periods(&supported) {
+                                Ok(o) => {
+                                    if let PeriocityRequest::LowestPossible = period {
+                                        o.min
+                                    } else {
+                                        o.default
+                                    }
+                                }
+                                Err(GetPeriodsError::DeviceNotAvailable) => {
+                                    return Err(BuildStreamError::DeviceNotAvailable)?;
+                                }
+                                Err(GetPeriodsError::FormatNotSupported) => {
+                                    return Err(BuildStreamError::StreamConfigNotSupported)?;
+                                }
+                                Err(GetPeriodsError::OperationNotSupported) => {
+                                    0 // TODO: Investigate this case
+                                }
+                                Err(GetPeriodsError::BackendSpecific { err }) => {
+                                    return Err(BuildStreamError::BackendSpecific { err })?;
+                                }
+                            }
+                        };
+
                         // client supports request lower period
                         c3.InitializeSharedAudioStream(
                             Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
@@ -1300,7 +1342,9 @@ impl BuildSink for Device {
                 client: IAudioClientWrapper(client),
                 render: render_client,
                 buf_size: max_frames_in_buffer,
-                block: waveformatex.nBlockAlign as _,
+                // block: waveformatex.nBlockAlign as _,
+                cfg,
+                fmt,
             })
         }
     }
@@ -1311,7 +1355,9 @@ pub struct WASAPISource {
     // client: IAudioClientWrapper,
     capture: IAudioCaptureClient,
     // buf_size: u32,
-    block: usize,
+    // block: usize,
+    fmt: SampleFormat,
+    cfg: StreamConfig,
 }
 
 impl Source for WASAPISource {
@@ -1335,7 +1381,6 @@ impl Source for WASAPISource {
                 println!("Capture flag not 0: {flags}");
             }
             if cbuf.is_null() || ftr == 0 {
-                f(Captures { data: &[] }).map_err(|e| SyncStreamError::User(e))?;
                 self.capture.ReleaseBuffer(0).map_err(|e| {
                     windows_err_to_cpal_err_message::<SyncStreamError>(
                         e,
@@ -1344,11 +1389,19 @@ impl Source for WASAPISource {
                 })?;
                 return Ok(AfterCapture {
                     available_next: Some(0),
+                    callback_triggered: false,
                 });
             }
 
-            let rbuf = slice::from_raw_parts(cbuf, ftr as usize * self.block);
-            let frames = f(Captures { data: &rbuf }).map_err(|e| SyncStreamError::User(e))?;
+            // let rbuf = slice::from_raw_parts(cbuf, ftr as usize * self.block);
+            let frames = f(Captures {
+                data: &Data::from_parts(
+                    cbuf as _,
+                    ftr as usize * self.cfg.channels as usize,
+                    self.fmt,
+                ),
+            })
+            .map_err(|e| SyncStreamError::User(e))?;
             self.capture.ReleaseBuffer(frames as u32).map_err(|e| {
                 windows_err_to_cpal_err_message::<SyncStreamError>(
                     e,
@@ -1356,6 +1409,7 @@ impl Source for WASAPISource {
                 )
             })?;
             return Ok(AfterCapture {
+                callback_triggered: true,
                 available_next: Some(self.capture.GetNextPacketSize().map_err(|e| {
                     windows_err_to_cpal_err_message::<SyncStreamError>(
                         e,
@@ -1364,6 +1418,10 @@ impl Source for WASAPISource {
                 })? as _),
             });
         }
+    }
+
+    fn permits_partial_capture(&self) -> bool {
+        false
     }
 }
 
@@ -1374,7 +1432,7 @@ impl BuildSource for Device {
         &mut self,
         cfg: StreamConfig,
         fmt: SampleFormat,
-        period: usize,
+        period: PeriocityRequest,
         ev: EventHandle,
     ) -> Result<Self::Output, BuildStreamError> {
         unsafe {
@@ -1410,7 +1468,8 @@ impl BuildSource for Device {
             }
 
             // Computing the format and initializing the device.
-            let waveformatex = {
+            // let waveformatex = {
+            let _ = {
                 let format_attempt = config_to_waveformatextensible(&cfg, fmt)
                     .ok_or(BuildStreamError::StreamConfigNotSupported)?;
                 let share_mode = Audio::AUDCLNT_SHAREMODE_SHARED;
@@ -1424,6 +1483,38 @@ impl BuildSource for Device {
 
                 let hresult = match audio_client.cast::<IAudioClient3>() {
                     Ok(c3) => {
+                        let period = if let PeriocityRequest::Approximate(p) = period {
+                            p
+                        } else {
+                            let supported = SupportedStreamConfig::new(
+                                cfg.channels,
+                                cfg.sample_rate,
+                                SupportedBufferSize::Unknown,
+                                fmt,
+                            );
+                            match self.get_periods(&supported) {
+                                Ok(o) => {
+                                    if let PeriocityRequest::LowestPossible = period {
+                                        o.min
+                                    } else {
+                                        o.default
+                                    }
+                                }
+                                Err(GetPeriodsError::DeviceNotAvailable) => {
+                                    return Err(BuildStreamError::DeviceNotAvailable)?;
+                                }
+                                Err(GetPeriodsError::FormatNotSupported) => {
+                                    return Err(BuildStreamError::StreamConfigNotSupported)?;
+                                }
+                                Err(GetPeriodsError::OperationNotSupported) => {
+                                    0 // TODO: Investigate this case
+                                }
+                                Err(GetPeriodsError::BackendSpecific { err }) => {
+                                    return Err(BuildStreamError::BackendSpecific { err })?;
+                                }
+                            }
+                        };
+
                         // client supports request lower period
                         c3.InitializeSharedAudioStream(
                             stream_flags,
@@ -1494,7 +1585,9 @@ impl BuildSource for Device {
                 // client: IAudioClientWrapper(audio_client),
                 capture: capture_client,
                 // buf_size: max_frames_in_buffer,
-                block: waveformatex.nBlockAlign as _,
+                // block: waveformatex.nBlockAlign as _,
+                cfg,
+                fmt,
             })
         }
     }

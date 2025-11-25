@@ -627,6 +627,27 @@ impl Data {
         }
     }
 
+    pub unsafe fn from_empty(sample_format: SampleFormat) -> Self {
+        let dangling = match sample_format {
+            SampleFormat::I8 => std::ptr::dangling_mut::<i8>() as *mut (),
+            SampleFormat::I16 => std::ptr::dangling_mut::<i16>() as *mut (),
+            SampleFormat::I24 => std::ptr::dangling_mut::<i32>() as *mut (), // rounded up
+            SampleFormat::I32 => std::ptr::dangling_mut::<i32>() as *mut (),
+            SampleFormat::I64 => std::ptr::dangling_mut::<i64>() as *mut (),
+
+            SampleFormat::U8 => std::ptr::dangling_mut::<u8>() as *mut (),
+            SampleFormat::U16 => std::ptr::dangling_mut::<u16>() as *mut (),
+            SampleFormat::U24 => std::ptr::dangling_mut::<u32>() as *mut (), // rounded up
+            SampleFormat::U32 => std::ptr::dangling_mut::<u32>() as *mut (),
+            SampleFormat::U64 => std::ptr::dangling_mut::<u64>() as *mut (),
+
+            SampleFormat::F32 => std::ptr::dangling_mut::<f32>() as *mut (),
+            SampleFormat::F64 => std::ptr::dangling_mut::<f64>() as *mut (),
+        };
+
+        Self::from_parts(dangling, 0, sample_format)
+    }
+
     /// The sample format of the internal audio data.
     pub fn sample_format(&self) -> SampleFormat {
         self.sample_format
