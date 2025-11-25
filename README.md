@@ -1,3 +1,7 @@
+# Note
+
+This fork added integrations with `IAudioClient3` for Wasapi host for low latency shared mode. However this fork declares new traits to work with audio streams that might not compatibale with other hosts and/or previous version of cpal
+
 # CPAL - Cross-Platform Audio Library
 
 [![Actions Status](https://github.com/RustAudio/cpal/workflows/cpal/badge.svg)](https://github.com/RustAudio/cpal/actions)
@@ -7,21 +11,21 @@ Low-level library for audio input and output in pure Rust.
 
 This library currently supports the following:
 
-- Enumerate supported audio hosts.
-- Enumerate all available audio devices.
-- Get the current default input and output devices.
-- Enumerate known supported input and output stream formats for a device.
-- Get the current default input and output stream formats for a device.
-- Build and run input and output PCM streams on a chosen device with a given stream format.
+-   Enumerate supported audio hosts.
+-   Enumerate all available audio devices.
+-   Get the current default input and output devices.
+-   Enumerate known supported input and output stream formats for a device.
+-   Get the current default input and output stream formats for a device.
+-   Build and run input and output PCM streams on a chosen device with a given stream format.
 
 Currently, supported hosts include:
 
-- Linux (via ALSA or JACK)
-- Windows (via WASAPI by default, see ASIO instructions below)
-- macOS (via CoreAudio)
-- iOS (via CoreAudio)
-- Android (via AAudio)
-- Emscripten
+-   Linux (via ALSA or JACK)
+-   Windows (via WASAPI by default, see ASIO instructions below)
+-   macOS (via CoreAudio)
+-   iOS (via CoreAudio)
+-   Android (via AAudio)
+-   Emscripten
 
 Note that on Linux, the ALSA development files are required. These are provided
 as part of the `libasound2-dev` package on Debian and Ubuntu distributions and
@@ -35,9 +39,9 @@ If you are interested in using CPAL with WASM, please see [this guide](https://g
 
 Some audio backends are optional and will only be compiled with a [feature flag](https://doc.rust-lang.org/cargo/reference/features.html).
 
-- JACK (on Linux): `jack`
-- ASIO (on Windows): `asio`
-- AudioWorklet (on Web): `web_audio_worklet`
+-   JACK (on Linux): `jack`
+-   ASIO (on Windows): `asio`
+-   AudioWorklet (on Web): `web_audio_worklet`
 
 For AudioWorklet backend usage see the README for the `web-audio-worklet-beep` example.
 
@@ -73,9 +77,9 @@ In an ideal situation you don't need to worry about this step.
 2. Add the LLVM `bin` directory to a `LIBCLANG_PATH` environment variable. If
    you installed LLVM to the default directory, this should work in the command
    prompt:
-   ```
-   setx LIBCLANG_PATH "C:\Program Files\LLVM\bin"
-   ```
+    ```
+    setx LIBCLANG_PATH "C:\Program Files\LLVM\bin"
+    ```
 3. If you don't have any ASIO devices or drivers available, you can [**download
    and install ASIO4ALL**](http://www.asio4all.org/). Be sure to enable the
    "offline" feature during installation despite what the installer says about
@@ -86,39 +90,39 @@ In an ideal situation you don't need to worry about this step.
    you may find the `vcvarsall.bat` manually and execute it with your machine architecture as an argument.
    The script will detect this and skip the step.
 
-   A manually executed command example for 64 bit machines:
+    A manually executed command example for 64 bit machines:
 
-   ```
-   "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvarsall.bat" amd64
-   ```
+    ```
+    "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvarsall.bat" amd64
+    ```
 
-   For more information please refer to the documentation of [`vcvarsall.bat``](https://docs.microsoft.com/en-us/cpp/build/building-on-the-command-line?view=msvc-160#vcvarsall-syntax).
+    For more information please refer to the documentation of [`vcvarsall.bat``](https://docs.microsoft.com/en-us/cpp/build/building-on-the-command-line?view=msvc-160#vcvarsall-syntax).
 
 5. Select the ASIO host at the start of our program with the following code:
 
-   ```rust
-   let host;
-   #[cfg(target_os = "windows")]
-   {
-      host = cpal::host_from_id(cpal::HostId::Asio).expect("failed to initialise ASIO host");
-   }
-   ```
+    ```rust
+    let host;
+    #[cfg(target_os = "windows")]
+    {
+       host = cpal::host_from_id(cpal::HostId::Asio).expect("failed to initialise ASIO host");
+    }
+    ```
 
-   If you run into compilations errors produced by `asio-sys` or `bindgen`, make
-   sure that `CPAL_ASIO_DIR` is set correctly and try `cargo clean`.
+    If you run into compilations errors produced by `asio-sys` or `bindgen`, make
+    sure that `CPAL_ASIO_DIR` is set correctly and try `cargo clean`.
 
 6. Make sure to enable the `asio` feature when building CPAL:
 
-   ```
-   cargo build --features "asio"
-   ```
+    ```
+    cargo build --features "asio"
+    ```
 
-   or if you are using CPAL as a dependency in a downstream project, enable the
-   feature like this:
+    or if you are using CPAL as a dependency in a downstream project, enable the
+    feature like this:
 
-   ```toml
-   cpal = { version = "*", features = ["asio"] }
-   ```
+    ```toml
+    cpal = { version = "*", features = ["asio"] }
+    ```
 
 _Updated as of ASIO version 2.3.3._
 
