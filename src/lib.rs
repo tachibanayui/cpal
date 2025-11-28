@@ -691,9 +691,107 @@ impl Data {
         if T::FORMAT == self.sample_format {
             // The safety of this block relies on correct construction of the `Data` instance. See
             // the unsafe `from_parts` constructor for these requirements.
-            unsafe { Some(std::slice::from_raw_parts(self.data as *const T, self.len)) }
+            unsafe { Some(self.as_slice_unchecked()) }
         } else {
             None
+        }
+    }
+
+    /// Access the data as a slice of sample type `T`.
+    /// SAFETY: User must make sure to use the correct sample format
+    pub unsafe fn as_slice_unchecked<T>(&self) -> &[T]
+    where
+        T: SizedSample,
+    {
+        // The safety of this block relies on correct construction of the `Data` instance. See
+        // the unsafe `from_parts` constructor for these requirements.
+        unsafe { std::slice::from_raw_parts(self.data as *const T, self.len) }
+    }
+
+    // I couldn't figure out how to make it into an iterator without compromising
+    // on performace with dyn and random Box allocation
+    pub fn to_sample_callback<T>(&self, mut cb: impl FnMut(T))
+    where
+        T: FromSample<i8>
+            + FromSample<i16>
+            + FromSample<i32>
+            + FromSample<i64>
+            + FromSample<u8>
+            + FromSample<u16>
+            + FromSample<u32>
+            + FromSample<u64>
+            + FromSample<f32>
+            + FromSample<f64>
+            + FromSample<I24>
+            + FromSample<U24>,
+    {
+        unsafe {
+            macro_rules! branch {
+                ( $ty:ty) => {{
+                    self.as_slice_unchecked::<$ty>()
+                        .iter()
+                        .copied()
+                        .for_each(|x| cb(x.to_sample()))
+                }};
+            }
+
+            match self.sample_format() {
+                SampleFormat::I8 => branch!(i16),
+                SampleFormat::I16 => branch!(i16),
+                SampleFormat::I24 => branch!(I24),
+                SampleFormat::I32 => branch!(i32),
+                SampleFormat::I64 => branch!(i64),
+                SampleFormat::U8 => branch!(u8),
+                SampleFormat::U16 => branch!(u16),
+                SampleFormat::U24 => branch!(U24),
+                SampleFormat::U32 => branch!(u32),
+                SampleFormat::U64 => branch!(u64),
+                SampleFormat::F32 => branch!(f32),
+                SampleFormat::F64 => branch!(f64),
+            }
+        }
+    }
+
+    /// Convert the current samples into f32 format, useful for dsp
+    pub fn to_sample<T>(&self, buf: &mut [T])
+    where
+        T: FromSample<i8>
+            + FromSample<i16>
+            + FromSample<i32>
+            + FromSample<i64>
+            + FromSample<u8>
+            + FromSample<u16>
+            + FromSample<u32>
+            + FromSample<u64>
+            + FromSample<f32>
+            + FromSample<f64>
+            + FromSample<I24>
+            + FromSample<U24>,
+    {
+        unsafe {
+            macro_rules! branch {
+                ( $ty:ty) => {{
+                    self.as_slice_unchecked::<$ty>()
+                        .iter()
+                        .map(|x| x.to_sample())
+                        .zip(buf.iter_mut())
+                        .for_each(|(d, b)| *b = d);
+                }};
+            }
+            match self.sample_format() {
+                SampleFormat::I8 => branch!(i8),
+                SampleFormat::I16 => branch!(i16),
+                SampleFormat::I24 => branch!(I24),
+                SampleFormat::I32 => branch!(i32),
+                SampleFormat::I64 => branch!(i64),
+                SampleFormat::U8 => branch!(u8),
+                SampleFormat::U16 => branch!(u16),
+                SampleFormat::U24 => branch!(U24),
+                SampleFormat::U32 => branch!(u32),
+                SampleFormat::U64 => branch!(u64),
+                SampleFormat::F32 => branch!(f32),
+                SampleFormat::F64 => branch!(f64),
+            }
         }
     }
 
