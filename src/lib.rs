@@ -164,6 +164,7 @@ extern crate js_sys;
 #[cfg(target_os = "emscripten")]
 extern crate web_sys;
 
+use dasp_sample::ToSample;
 pub use error::*;
 pub use platform::{
     available_hosts, default_host, host_from_id, Device, Devices, Host, HostId, Stream,
@@ -708,6 +709,66 @@ impl Data {
         unsafe { std::slice::from_raw_parts(self.data as *const T, self.len) }
     }
 
+    /// Access the data as a slice of sample type `T`.
+    /// SAFETY: User must make sure to use the correct sample format
+    pub unsafe fn as_slice_mut_unchecked<T>(&mut self) -> &mut [T]
+    where
+        T: SizedSample,
+    {
+        // The safety of this block relies on correct construction of the `Data` instance. See
+        // the unsafe `from_parts` constructor for these requirements.
+        unsafe { std::slice::from_raw_parts_mut(self.data as *mut _ as *mut T, self.len) }
+    }
+
+    /// Read from iter and convert to this [`Data`] native format
+    pub fn convert_from_iter<
+        T: SizedSample
+            + ToSample<i8>
+            + ToSample<i16>
+            + ToSample<i32>
+            + ToSample<i64>
+            + ToSample<u8>
+            + ToSample<u16>
+            + ToSample<u32>
+            + ToSample<u64>
+            + ToSample<f32>
+            + ToSample<f64>
+            + ToSample<I24>
+            + ToSample<I48>
+            + ToSample<U24>
+            + ToSample<U48>,
+    >(
+        &mut self,
+        iter: impl Iterator<Item = T>,
+    ) -> usize {
+        unsafe {
+            macro_rules! branch {
+                ($ty:ty) => {{
+                    self.as_slice_mut_unchecked::<$ty>()
+                        .iter_mut()
+                        .zip(iter)
+                        .map(|(buf, data)| *buf = data.to_sample())
+                        .count()
+                }};
+            }
+
+            match self.sample_format() {
+                SampleFormat::I8 => branch!(i8),
+                SampleFormat::I16 => branch!(i16),
+                SampleFormat::I24 => branch!(I24),
+                SampleFormat::I32 => branch!(i32),
+                SampleFormat::I64 => branch!(i64),
+                SampleFormat::U8 => branch!(u8),
+                SampleFormat::U16 => branch!(u16),
+                SampleFormat::U24 => branch!(U24),
+                SampleFormat::U32 => branch!(u32),
+                SampleFormat::U64 => branch!(u64),
+                SampleFormat::F32 => branch!(f32),
+                SampleFormat::F64 => branch!(f64),
+            }
+        }
+    }
+
     // I couldn't figure out how to make it into an iterator without compromising
     // on performace with dyn and random Box allocation
     pub fn to_sample_callback<T>(&self, mut cb: impl FnMut(T))
@@ -727,7 +788,7 @@ impl Data {
     {
         unsafe {
             macro_rules! branch {
-                ( $ty:ty) => {{
+                ($ty:ty) => {{
                     self.as_slice_unchecked::<$ty>()
                         .iter()
                         .copied()
@@ -736,7 +797,7 @@ impl Data {
             }
 
             match self.sample_format() {
-                SampleFormat::I8 => branch!(i16),
+                SampleFormat::I8 => branch!(i8),
                 SampleFormat::I16 => branch!(i16),
                 SampleFormat::I24 => branch!(I24),
                 SampleFormat::I32 => branch!(i32),
@@ -770,7 +831,7 @@ impl Data {
     {
         unsafe {
             macro_rules! branch {
-                ( $ty:ty) => {{
+                ($ty:ty) => {{
                     self.as_slice_unchecked::<$ty>()
                         .iter()
                         .map(|x| x.to_sample())
