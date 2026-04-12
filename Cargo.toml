@@ -69,12 +69,6 @@ audioworklet = [
 # Platform: All platforms
 custom = []
 
-# JACK Audio Connection Kit backend
-# Provides low-latency connections between applications and audio hardware
-# Requires: JACK server and client libraries installed on the system
-# Platform: Linux, DragonFly BSD, FreeBSD, NetBSD, macOS, Windows
-# Note: JACK must be installed separately on all platforms
-jack = ["dep:jack"]
 
 # PipeWire backend
 # Provides audio I/O on Linux and some BSDs via the PipeWire multimedia server
@@ -88,12 +82,6 @@ pipewire = ["dep:pipewire"]
 # Platform: Linux, DragonFly BSD, FreeBSD, NetBSD
 pulseaudio = ["dep:pulseaudio", "dep:futures"]
 
-# WebAssembly backend using wasm-bindgen
-# Enables the Web Audio API backend for browser-based audio
-# Required for any WebAssembly audio support
-# Platform: WebAssembly (wasm32-unknown-unknown)
-# Note: This is typically enabled automatically when targeting wasm32
-wasm-bindgen = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures"]
 
 [dependencies]
 dasp_sample = "0.11"
