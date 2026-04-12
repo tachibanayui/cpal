@@ -2,6 +2,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::time::Instant;
 
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
@@ -19,7 +20,10 @@ struct MyDevice;
 // Only Send+Sync is needed
 struct MyStream {
     controls: Arc<StreamControls>,
-    // option is needed since joining a thread takes ownership,
+    // The instant the audio thread was started; shared with now() so that
+    // callback timestamps and now() are on the same time base.
+    start: Instant,
+    // Option is needed since joining a thread takes ownership,
     // and we want to do that on drop (gives us &mut self, not self)
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -28,6 +32,9 @@ struct StreamControls {
     exit: AtomicBool,
     pause: AtomicBool,
 }
+
+const CHANNEL_COUNT: cpal::ChannelCount = 2;
+const BUFFER_SIZE: cpal::FrameCount = 4096;
 
 impl HostTrait for MyHost {
     type Device = MyDevice;
@@ -77,10 +84,13 @@ impl DeviceTrait for MyDevice {
         &self,
     ) -> Result<Self::SupportedOutputConfigs, cpal::SupportedStreamConfigsError> {
         Ok(std::iter::once(cpal::SupportedStreamConfigRange::new(
-            2,
+            CHANNEL_COUNT,
             44100,
             44100,
-            cpal::SupportedBufferSize::Unknown,
+            cpal::SupportedBufferSize::Range {
+                min: BUFFER_SIZE,
+                max: BUFFER_SIZE,
+            },
             cpal::SampleFormat::F32,
         )))
     }
@@ -95,16 +105,19 @@ impl DeviceTrait for MyDevice {
         &self,
     ) -> Result<cpal::SupportedStreamConfig, cpal::DefaultStreamConfigError> {
         Ok(cpal::SupportedStreamConfig::new(
-            2,
+            CHANNEL_COUNT,
             44100,
-            cpal::SupportedBufferSize::Unknown,
+            cpal::SupportedBufferSize::Range {
+                min: BUFFER_SIZE,
+                max: BUFFER_SIZE,
+            },
             cpal::SampleFormat::I16,
         ))
     }
 
     fn build_input_stream_raw<D, E>(
         &self,
-        _: &cpal::StreamConfig,
+        _: cpal::StreamConfig,
         _: cpal::SampleFormat,
         _: D,
         _: E,
@@ -123,7 +136,7 @@ impl DeviceTrait for MyDevice {
     // a proper impl would also check the stream config and sample format, as well as handle errors
     fn build_output_stream_raw<D, E>(
         &self,
-        _: &cpal::StreamConfig,
+        _: cpal::StreamConfig,
         _: cpal::SampleFormat,
         mut data_callback: D,
         _: E,
@@ -138,10 +151,10 @@ impl DeviceTrait for MyDevice {
             pause: AtomicBool::new(true), // streams are expected to start out paused by default
         });
 
+        let start = Instant::now();
         let thread_controls = controls.clone();
         let handle = std::thread::spawn(move || {
-            let start = std::time::Instant::now();
-            let mut buffer = [0.0_f32; 4096];
+            let mut buffer = [0.0_f32; BUFFER_SIZE as usize * CHANNEL_COUNT as usize];
             while !thread_controls.exit.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_secs_f32(
                     buffer.len() as f32 / 44100.0,
@@ -161,7 +174,7 @@ impl DeviceTrait for MyDevice {
                     )
                 };
 
-                let duration = std::time::Instant::now().duration_since(start);
+                let duration = Instant::now().duration_since(start);
                 let secs = duration.as_nanos() / 1_000_000_000;
                 let subsec_nanos = duration.as_nanos() - secs * 1_000_000_000;
                 let stream_instant = cpal::StreamInstant::new(secs as _, subsec_nanos as _);
@@ -178,6 +191,7 @@ impl DeviceTrait for MyDevice {
 
         Ok(MyStream {
             controls,
+            start,
             handle: Some(handle),
         })
     }
@@ -192,6 +206,15 @@ impl StreamTrait for MyStream {
     fn pause(&self) -> Result<(), cpal::PauseStreamError> {
         self.controls.pause.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    fn now(&self) -> cpal::StreamInstant {
+        let elapsed = self.start.elapsed();
+        cpal::StreamInstant::new(elapsed.as_secs(), elapsed.subsec_nanos())
+    }
+
+    fn buffer_size(&self) -> Result<cpal::FrameCount, cpal::StreamError> {
+        Ok(BUFFER_SIZE)
     }
 }
 
@@ -212,7 +235,7 @@ fn main() {
     let device = host.default_output_device().unwrap();
     let config = device.default_output_config().unwrap();
 
-    let stream = make_stream(&device, &config.into()).unwrap();
+    let stream = make_stream(&device, config.into()).unwrap();
     stream.play().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(4000));
 }
@@ -297,7 +320,7 @@ impl Oscillator {
 
 pub fn make_stream(
     device: &cpal::Device,
-    config: &cpal::StreamConfig,
+    config: cpal::StreamConfig,
 ) -> Result<cpal::Stream, anyhow::Error> {
     let num_channels = config.channels as usize;
     let mut oscillator = Oscillator {
@@ -315,9 +338,7 @@ pub fn make_stream(
         config,
         move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
             // for 0-1s play sine, 1-2s play square, 2-3s play saw, 3-4s play triangle_wave
-            let time_since_start = std::time::Instant::now()
-                .duration_since(time_at_start)
-                .as_secs_f32();
+            let time_since_start = Instant::now().duration_since(time_at_start).as_secs_f32();
             if time_since_start < 1.0 {
                 oscillator.set_waveform(Waveform::Sine);
             } else if time_since_start < 2.0 {

@@ -1,25 +1,26 @@
 [package]
 name = "cpal"
-version = "0.17.0"
+version = "0.18.0"
 description = "Low-level cross-platform audio I/O library in pure Rust."
 repository = "https://github.com/RustAudio/cpal"
 documentation = "https://docs.rs/cpal"
 license = "Apache-2.0"
 keywords = ["audio", "sound"]
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.78"
 
 [features]
-default = []
+# Audio thread priority elevation
+# Raises the audio callback thread to real-time priority for lower latency and fewer glitches
+# Requires: On Linux, either rtkit or appropriate user permissions (e.g. limits.conf or capabilities)
+# Platform: Linux, DragonFly BSD, FreeBSD, NetBSD, Windows
+audio_thread_priority = ["dep:audio_thread_priority"]
 
 # ASIO backend for Windows
 # Provides low-latency audio I/O by bypassing the Windows audio stack
 # Requires: ASIO drivers and LLVM/Clang for build-time bindings
 # See README for detailed setup instructions
-asio = [
-    "dep:asio-sys",
-    "dep:num-traits",
-]
+asio = ["dep:asio-sys", "dep:num-traits"]
 
 # Legacy Windows audio device activation mode. When enabled:
 # - Uses IMMDevice::Activate instead of ActivateAudioInterfaceAsync
@@ -68,6 +69,32 @@ audioworklet = [
 # Platform: All platforms
 custom = []
 
+# JACK Audio Connection Kit backend
+# Provides low-latency connections between applications and audio hardware
+# Requires: JACK server and client libraries installed on the system
+# Platform: Linux, DragonFly BSD, FreeBSD, NetBSD, macOS, Windows
+# Note: JACK must be installed separately on all platforms
+jack = ["dep:jack"]
+
+# PipeWire backend
+# Provides audio I/O on Linux and some BSDs via the PipeWire multimedia server
+# Requires: PipeWire server and client libraries installed on the system
+# Platform: Linux, DragonFly BSD, FreeBSD, NetBSD
+pipewire = ["dep:pipewire"]
+
+# PulseAudio backend
+# Provides audio I/O support on Linux and some BSDs using the PulseAudio sound server
+# Requires: PulseAudio server and client libraries installed on the system
+# Platform: Linux, DragonFly BSD, FreeBSD, NetBSD
+pulseaudio = ["dep:pulseaudio", "dep:futures"]
+
+# WebAssembly backend using wasm-bindgen
+# Enables the Web Audio API backend for browser-based audio
+# Required for any WebAssembly audio support
+# Platform: WebAssembly (wasm32-unknown-unknown)
+# Note: This is typically enabled automatically when targeting wasm32
+wasm-bindgen = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures"]
+
 [dependencies]
 dasp_sample = "0.11"
 
@@ -75,16 +102,18 @@ dasp_sample = "0.11"
 anyhow = "1.0"
 hound = "3.5"
 ringbuf = "0.4"
-clap = { version = ">=4.0, <=4.5", features = ["derive"] }
+clap = { version = ">=4.0, <=4.5.57", features = ["derive"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.62.2", features = [
+windows = { version = ">=0.59, <=0.62", features = [
+    "Win32_Media",
     "Win32_Media_Audio",
     "Win32_Foundation",
     "Win32_Devices_Properties",
     "Win32_Media_KernelStreaming",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Threading",
+    "Win32_System_Performance",
     "Win32_Security",
     "Win32_System_SystemServices",
     "Win32_System_Variant",
@@ -94,22 +123,22 @@ windows = { version = "0.62.2", features = [
 # Explicitly depend on windows-core for use with the `windows::core::implement` macro.
 windows-core = "0.62.2"
 audio_thread_priority = { version = "0.34", optional = true }
-asio-sys = { version = "0.2", path = "asio-sys", optional = true }
+asio-sys = { version = "0.3.0", path = "asio-sys", optional = true }
 num-traits = { version = "0.2", optional = true }
+jack = { version = "0.13", optional = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd"))'.dependencies]
-alsa = "0.10"
+alsa = "0.11"
 libc = "0.2"
 audio_thread_priority = { version = "0.34", optional = true }
 jack = { version = "0.13", optional = true }
-
-[target.'cfg(target_os = "windows")'.dependencies.jack]
-version = "0.13"
-optional = true
+pulseaudio = { version = "0.3", optional = true }
+futures = { version = "0.3", optional = true }
+pipewire = { version = "0.9", optional = true, features = ["v0_3_53"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 mach2 = "0.5"
-coreaudio-rs = { version = "0.13", default-features = false, features = [
+coreaudio-rs = { version = "0.14", default-features = false, features = [
     "core_audio",
     "audio_toolbox",
 ] }
@@ -132,6 +161,8 @@ objc2-core-audio-types = { version = "0.3", default-features = false, features =
 objc2-core-foundation = { version = "0.3" }
 objc2-foundation = { version = "0.3" }
 objc2 = { version = "0.6" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
 jack = { version = "0.13", optional = true }
 
 [target.'cfg(target_os = "ios")'.dependencies]
@@ -177,6 +208,7 @@ ndk = { version = "0.9", default-features = false, features = [
 ] }
 ndk-context = "0.1"
 jni = "0.21"
+libc = "0.2"
 num-derive = "0.4"
 num-traits = "0.2"
 

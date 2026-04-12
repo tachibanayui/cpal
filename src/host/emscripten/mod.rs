@@ -3,6 +3,7 @@
 //! Default backend on Emscripten.
 
 use js_sys::Float32Array;
+use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -11,11 +12,11 @@ use web_sys::AudioContext;
 
 use crate::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::{
-    BufferSize, BuildStreamError, Data, DefaultStreamConfigError, DeviceDescription,
-    DeviceDescriptionBuilder, DeviceId, DeviceIdError, DeviceNameError, DevicesError,
+    BufferSize, BuildStreamError, ChannelCount, Data, DefaultStreamConfigError, DeviceDescription,
+    DeviceDescriptionBuilder, DeviceId, DeviceIdError, DeviceNameError, DevicesError, FrameCount,
     InputCallbackInfo, OutputCallbackInfo, PauseStreamError, PlayStreamError, SampleFormat,
-    SampleRate, StreamConfig, StreamError, SupportedBufferSize, SupportedStreamConfig,
-    SupportedStreamConfigRange, SupportedStreamConfigsError,
+    SampleRate, StreamConfig, StreamError, StreamInstant, SupportedBufferSize,
+    SupportedStreamConfig, SupportedStreamConfigRange, SupportedStreamConfigsError,
 };
 
 // The emscripten backend currently works by instantiating an `AudioContext` object per `Stream`.
@@ -35,8 +36,8 @@ pub struct Device;
 #[wasm_bindgen]
 #[derive(Clone)]
 pub struct Stream {
-    // A reference to an `AudioContext` object.
     audio_ctxt: AudioContext,
+    buffer_size_frames: FrameCount,
 }
 
 // WASM runs in a single-threaded environment, so Send and Sync are safe by design.
@@ -49,14 +50,14 @@ crate::assert_stream_sync!(Stream);
 
 pub use crate::iter::{SupportedInputConfigs, SupportedOutputConfigs};
 
-const MIN_CHANNELS: u16 = 1;
-const MAX_CHANNELS: u16 = 32;
+const MIN_CHANNELS: ChannelCount = 1;
+const MAX_CHANNELS: ChannelCount = 32;
 const MIN_SAMPLE_RATE: SampleRate = 8_000;
 const MAX_SAMPLE_RATE: SampleRate = 96_000;
 const DEFAULT_SAMPLE_RATE: SampleRate = 44_100;
-const MIN_BUFFER_SIZE: u32 = 1;
-const MAX_BUFFER_SIZE: u32 = u32::MAX;
-const DEFAULT_BUFFER_SIZE: usize = 2048;
+const MIN_BUFFER_SIZE: FrameCount = 1;
+const MAX_BUFFER_SIZE: FrameCount = FrameCount::MAX;
+const DEFAULT_BUFFER_SIZE: FrameCount = 2048;
 const SUPPORTED_SAMPLE_FORMAT: SampleFormat = SampleFormat::F32;
 
 impl Host {
@@ -184,7 +185,7 @@ impl DeviceTrait for Device {
 
     fn build_input_stream_raw<D, E>(
         &self,
-        _config: &StreamConfig,
+        _config: StreamConfig,
         _sample_format: SampleFormat,
         _data_callback: D,
         _error_callback: E,
@@ -199,7 +200,7 @@ impl DeviceTrait for Device {
 
     fn build_output_stream_raw<D, E>(
         &self,
-        config: &StreamConfig,
+        config: StreamConfig,
         sample_format: SampleFormat,
         data_callback: D,
         _error_callback: E,
@@ -218,14 +219,17 @@ impl DeviceTrait for Device {
                 if !(MIN_BUFFER_SIZE..=MAX_BUFFER_SIZE).contains(&v) {
                     return Err(BuildStreamError::StreamConfigNotSupported);
                 }
-                v as usize
+                v
             }
             BufferSize::Default => DEFAULT_BUFFER_SIZE,
         };
 
         // Create the stream.
         let audio_ctxt = AudioContext::new().expect("webaudio is not present on this system");
-        let stream = Stream { audio_ctxt };
+        let stream = Stream {
+            audio_ctxt,
+            buffer_size_frames,
+        };
 
         // Use `set_timeout` to invoke a Rust callback repeatedly.
         //
@@ -233,13 +237,14 @@ impl DeviceTrait for Device {
         //
         // See also: The call to `set_timeout` at the end of the `audio_callback_fn` which creates
         // the loop.
+        let data_callback = AssertUnwindSafe(data_callback);
         set_timeout(
             10,
             stream.clone(),
             data_callback,
             config,
             sample_format,
-            buffer_size_frames as u32,
+            buffer_size_frames,
         );
 
         Ok(stream)
@@ -247,6 +252,10 @@ impl DeviceTrait for Device {
 }
 
 impl StreamTrait for Stream {
+    fn buffer_size(&self) -> Result<crate::FrameCount, crate::StreamError> {
+        Ok(self.buffer_size_frames)
+    }
+
     fn play(&self) -> Result<(), PlayStreamError> {
         let future = JsFuture::from(
             self.audio_ctxt
@@ -276,11 +285,15 @@ impl StreamTrait for Stream {
         });
         Ok(())
     }
+
+    fn now(&self) -> StreamInstant {
+        StreamInstant::from_secs_f64(self.audio_ctxt.current_time())
+    }
 }
 
 fn audio_callback_fn<D>(
-    mut data_callback: D,
-) -> impl FnOnce(Stream, StreamConfig, SampleFormat, u32)
+    mut data_callback: AssertUnwindSafe<D>,
+) -> impl FnOnce(Stream, StreamConfig, SampleFormat, FrameCount)
 where
     D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
 {
@@ -297,15 +310,13 @@ where
             let data = temporary_buffer.as_mut_ptr() as *mut ();
             let mut data = unsafe { Data::from_parts(data, len, sample_format) };
             let now_secs: f64 = audio_ctxt.current_time();
-            let callback = crate::StreamInstant::from_secs_f64(now_secs);
+            let callback = StreamInstant::from_secs_f64(now_secs);
             // TODO: Use proper latency instead. Currently, unsupported on most browsers though, so
             // we estimate based on buffer size instead. Probably should use this, but it's only
             // supported by firefox (2020-04-28).
             // let latency_secs: f64 = audio_ctxt.outputLatency.try_into().unwrap();
             let buffer_duration = frames_to_duration(len, sample_rate as usize);
-            let playback = callback
-                .add(buffer_duration)
-                .expect("`playback` occurs beyond representation supported by `StreamInstant`");
+            let playback = callback + buffer_duration;
             let timestamp = crate::OutputStreamTimestamp { callback, playback };
             let info = OutputCallbackInfo { timestamp };
             data_callback(&mut data, &info);
@@ -351,7 +362,7 @@ where
             1000 * buffer_size_frames as i32 / sample_rate as i32,
             stream.clone().clone(),
             data_callback,
-            &config,
+            config,
             sample_format,
             buffer_size_frames,
         );
@@ -361,10 +372,10 @@ where
 fn set_timeout<D>(
     time: i32,
     stream: Stream,
-    data_callback: D,
-    config: &StreamConfig,
+    data_callback: AssertUnwindSafe<D>,
+    config: StreamConfig,
     sample_format: SampleFormat,
-    buffer_size_frames: u32,
+    buffer_size_frames: FrameCount,
 ) where
     D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
 {
@@ -376,7 +387,7 @@ fn set_timeout<D>(
                 .expect("The function was somehow not a function"),
             time,
             &stream.into(),
-            &((*config).clone()).into(),
+            &config.into(),
             &Closure::once_into_js(move || sample_format),
             &buffer_size_frames.into(),
         )
@@ -420,7 +431,7 @@ fn is_webaudio_available() -> bool {
 }
 
 // Whether or not the given stream configuration is valid for building a stream.
-fn valid_config(conf: &StreamConfig, sample_format: SampleFormat) -> bool {
+fn valid_config(conf: StreamConfig, sample_format: SampleFormat) -> bool {
     conf.channels <= MAX_CHANNELS
         && conf.channels >= MIN_CHANNELS
         && conf.sample_rate <= MAX_SAMPLE_RATE
