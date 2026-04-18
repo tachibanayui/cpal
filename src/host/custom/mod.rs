@@ -7,7 +7,7 @@ use crate::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::{
     BuildStreamError, Data, DefaultStreamConfigError, DeviceDescription, DeviceId, DeviceIdError,
     DeviceNameError, DevicesError, InputCallbackInfo, OutputCallbackInfo, PauseStreamError,
-    PlayStreamError, SampleFormat, StreamConfig, StreamError, SupportedStreamConfig,
+    PlayStreamError, SampleFormat, StreamConfig, StreamError, StreamInstant, SupportedStreamConfig,
     SupportedStreamConfigRange, SupportedStreamConfigsError,
 };
 use core::time::Duration;
@@ -156,7 +156,7 @@ trait DeviceErased: Send + Sync {
     fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError>;
     fn build_input_stream_raw(
         &self,
-        config: &StreamConfig,
+        config: StreamConfig,
         sample_format: SampleFormat,
         data_callback: InputCallback,
         error_callback: ErrorCallback,
@@ -164,7 +164,7 @@ trait DeviceErased: Send + Sync {
     ) -> Result<Stream, BuildStreamError>;
     fn build_output_stream_raw(
         &self,
-        config: &StreamConfig,
+        config: StreamConfig,
         sample_format: SampleFormat,
         data_callback: OutputCallback,
         error_callback: ErrorCallback,
@@ -177,6 +177,8 @@ trait DeviceErased: Send + Sync {
 trait StreamErased: Send + Sync {
     fn play(&self) -> Result<(), PlayStreamError>;
     fn pause(&self) -> Result<(), PauseStreamError>;
+    fn now(&self) -> StreamInstant;
+    fn buffer_size(&self) -> Result<crate::FrameCount, crate::StreamError>;
 }
 
 fn device_to_erased(d: impl DeviceErased + 'static) -> Device {
@@ -260,7 +262,7 @@ where
 
     fn build_input_stream_raw(
         &self,
-        config: &StreamConfig,
+        config: StreamConfig,
         sample_format: SampleFormat,
         data_callback: InputCallback,
         error_callback: ErrorCallback,
@@ -279,7 +281,7 @@ where
 
     fn build_output_stream_raw(
         &self,
-        config: &StreamConfig,
+        config: StreamConfig,
         sample_format: SampleFormat,
         data_callback: OutputCallback,
         error_callback: ErrorCallback,
@@ -311,6 +313,14 @@ where
 
     fn pause(&self) -> Result<(), PauseStreamError> {
         <T as StreamTrait>::pause(self)
+    }
+
+    fn now(&self) -> StreamInstant {
+        <T as StreamTrait>::now(self)
+    }
+
+    fn buffer_size(&self) -> Result<crate::FrameCount, crate::StreamError> {
+        <T as StreamTrait>::buffer_size(self)
     }
 }
 
@@ -386,7 +396,7 @@ impl DeviceTrait for Device {
 
     fn build_input_stream_raw<D, E>(
         &self,
-        config: &StreamConfig,
+        config: StreamConfig,
         sample_format: SampleFormat,
         data_callback: D,
         error_callback: E,
@@ -407,7 +417,7 @@ impl DeviceTrait for Device {
 
     fn build_output_stream_raw<D, E>(
         &self,
-        config: &StreamConfig,
+        config: StreamConfig,
         sample_format: SampleFormat,
         data_callback: D,
         error_callback: E,
@@ -434,5 +444,13 @@ impl StreamTrait for Stream {
 
     fn pause(&self) -> Result<(), PauseStreamError> {
         self.0.pause()
+    }
+
+    fn now(&self) -> StreamInstant {
+        self.0.now()
+    }
+
+    fn buffer_size(&self) -> Result<crate::FrameCount, crate::StreamError> {
+        self.0.buffer_size()
     }
 }

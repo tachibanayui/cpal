@@ -7,10 +7,7 @@
 //! a different byte order.
 
 use std::{fmt::Display, mem};
-#[cfg(all(
-    target_arch = "wasm32",
-    any(target_os = "emscripten", feature = "wasm-bindgen")
-))]
+#[cfg(all(target_arch = "wasm32", feature = "wasm-bindgen"))]
 use wasm_bindgen::prelude::*;
 
 pub use dasp_sample::{FromSample, Sample};
@@ -51,13 +48,7 @@ pub use dasp_sample::U24;
 ///
 /// [`is_float`]: SampleFormat::is_float
 /// [`supported_input_configs`]: crate::traits::DeviceTrait::supported_input_configs
-#[cfg_attr(
-    all(
-        target_arch = "wasm32",
-        any(target_os = "emscripten", feature = "wasm-bindgen")
-    ),
-    wasm_bindgen
-)]
+#[cfg_attr(all(target_arch = "wasm32", feature = "wasm-bindgen"), wasm_bindgen)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum SampleFormat {
@@ -105,6 +96,15 @@ pub enum SampleFormat {
 
     /// `f64` with a valid range of `-1.0..=1.0` with `0.0` being the origin.
     F64,
+
+    /// DSD 1-bit stream in u8 container (8 bits = 8 DSD samples) with 0x69 being the silence byte pattern.
+    DsdU8,
+
+    /// DSD 1-bit stream in u16 container (16 bits = 16 DSD samples) with 0x69 being the silence byte pattern.
+    DsdU16,
+
+    /// DSD 1-bit stream in u32 container (32 bits = 32 DSD samples) with 0x69 being the silence byte pattern.
+    DsdU32,
 }
 
 impl SampleFormat {
@@ -129,6 +129,9 @@ impl SampleFormat {
             SampleFormat::U64 => mem::size_of::<u64>(),
             SampleFormat::F32 => mem::size_of::<f32>(),
             SampleFormat::F64 => mem::size_of::<f64>(),
+            SampleFormat::DsdU8 => mem::size_of::<u8>(),
+            SampleFormat::DsdU16 => mem::size_of::<u16>(),
+            SampleFormat::DsdU32 => mem::size_of::<u32>(),
         }
     }
 
@@ -153,6 +156,7 @@ impl SampleFormat {
             SampleFormat::U64 => u64::BITS,
             SampleFormat::F32 => 32,
             SampleFormat::F64 => 64,
+            SampleFormat::DsdU8 | SampleFormat::DsdU16 | SampleFormat::DsdU32 => 1,
         }
     }
 
@@ -189,6 +193,15 @@ impl SampleFormat {
     pub fn is_float(&self) -> bool {
         matches!(*self, SampleFormat::F32 | SampleFormat::F64)
     }
+
+    #[inline]
+    #[must_use]
+    pub fn is_dsd(&self) -> bool {
+        matches!(
+            *self,
+            SampleFormat::DsdU8 | SampleFormat::DsdU16 | SampleFormat::DsdU32
+        )
+    }
 }
 
 impl Display for SampleFormat {
@@ -208,6 +221,9 @@ impl Display for SampleFormat {
             SampleFormat::U64 => "u64",
             SampleFormat::F32 => "f32",
             SampleFormat::F64 => "f64",
+            SampleFormat::DsdU8 => "dsdu8",
+            SampleFormat::DsdU16 => "dsdu16",
+            SampleFormat::DsdU32 => "dsdu32",
         }
         .fmt(f)
     }

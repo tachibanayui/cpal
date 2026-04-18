@@ -12,8 +12,8 @@ use std::sync::{mpsc, Arc, Mutex, Weak};
 pub use self::enumerate::{default_input_device, default_output_device, Devices};
 
 use objc2_core_audio::{
-    kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyElementMain,
-    kAudioObjectPropertyScopeGlobal, AudioObjectPropertyAddress,
+    kAudioDevicePropertyDeviceIsAlive, kAudioDevicePropertyNominalSampleRate,
+    kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal, AudioObjectPropertyAddress,
 };
 use property_listener::AudioObjectPropertyListener;
 
@@ -103,28 +103,41 @@ impl DisconnectManager {
         error_callback: Arc<Mutex<ErrorCallback>>,
     ) -> Result<Self, crate::BuildStreamError> {
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
-        let (disconnect_tx, disconnect_rx) = mpsc::channel();
+        let (disconnect_tx, disconnect_rx) = mpsc::channel::<crate::StreamError>();
         let (ready_tx, ready_rx) = mpsc::channel();
 
-        // Spawn dedicated thread to own the AudioObjectPropertyListener
-        let disconnect_tx_clone = disconnect_tx.clone();
+        // Spawn a dedicated thread to own both listeners. CoreAudio requires that
+        // AudioObjectPropertyListeners are added and removed on the same thread.
+        let disconnect_tx_alive = disconnect_tx.clone();
+        let disconnect_tx_rate = disconnect_tx;
         std::thread::spawn(move || {
-            let property_address = AudioObjectPropertyAddress {
+            let alive_address = AudioObjectPropertyAddress {
                 mSelector: kAudioDevicePropertyDeviceIsAlive,
                 mScope: kAudioObjectPropertyScopeGlobal,
                 mElement: kAudioObjectPropertyElementMain,
             };
+            let alive_listener =
+                AudioObjectPropertyListener::new(device_id, alive_address, move || {
+                    let _ = disconnect_tx_alive.send(crate::StreamError::DeviceNotAvailable);
+                });
 
-            // Create the listener on this dedicated thread
-            match AudioObjectPropertyListener::new(device_id, property_address, move || {
-                let _ = disconnect_tx_clone.send(());
-            }) {
-                Ok(_listener) => {
+            let rate_address = AudioObjectPropertyAddress {
+                mSelector: kAudioDevicePropertyNominalSampleRate,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain,
+            };
+            let rate_listener =
+                AudioObjectPropertyListener::new(device_id, rate_address, move || {
+                    let _ = disconnect_tx_rate.send(crate::StreamError::StreamInvalidated);
+                });
+
+            match (alive_listener, rate_listener) {
+                (Ok(_alive), Ok(_rate)) => {
                     let _ = ready_tx.send(Ok(()));
-                    // Drop the listener on this thread after receiving a shutdown signal
+                    // Block until the stream is dropped; listeners are removed on drop.
                     let _ = shutdown_rx.recv();
                 }
-                Err(e) => {
+                (Err(e), _) | (_, Err(e)) => {
                     let _ = ready_tx.send(Err(e));
                 }
             }
@@ -143,21 +156,13 @@ impl DisconnectManager {
         let stream_weak_clone = stream_weak.clone();
         let error_callback_clone = error_callback.clone();
         std::thread::spawn(move || {
-            while disconnect_rx.recv().is_ok() {
-                // Check if stream still exists
+            while let Ok(err) = disconnect_rx.recv() {
                 if let Some(stream_arc) = stream_weak_clone.upgrade() {
-                    // First, try to pause the stream to stop playback
                     if let Ok(mut stream_inner) = stream_arc.try_lock() {
                         let _ = stream_inner.pause();
                     }
-
-                    // Always try to notify about device disconnection
-                    invoke_error_callback(
-                        &error_callback_clone,
-                        crate::StreamError::DeviceNotAvailable,
-                    );
+                    invoke_error_callback(&error_callback_clone, err);
                 } else {
-                    // Stream is gone, exit the handler thread
                     break;
                 }
             }
@@ -237,29 +242,24 @@ impl Stream {
 
 impl StreamTrait for Stream {
     fn play(&self) -> Result<(), PlayStreamError> {
-        let mut stream = self
-            .inner
-            .lock()
-            .map_err(|_| PlayStreamError::BackendSpecific {
-                err: BackendSpecificError {
-                    description: "A cpal stream operation panicked while holding the lock - this is a bug, please report it".to_string(),
-                },
-            })?;
-
-        stream.play()
+        self.inner.lock().expect("stream lock poisoned").play()
     }
 
     fn pause(&self) -> Result<(), PauseStreamError> {
-        let mut stream = self
-            .inner
-            .lock()
-            .map_err(|_| PauseStreamError::BackendSpecific {
-                err: BackendSpecificError {
-                    description: "A cpal stream operation panicked while holding the lock - this is a bug, please report it".to_string(),
-                },
-            })?;
+        self.inner.lock().expect("stream lock poisoned").pause()
+    }
 
-        stream.pause()
+    fn now(&self) -> crate::StreamInstant {
+        let m_host_time = unsafe { mach2::mach_time::mach_absolute_time() };
+        host_time_to_stream_instant(m_host_time).expect("mach_timebase_info failed")
+    }
+
+    fn buffer_size(&self) -> Result<crate::FrameCount, crate::StreamError> {
+        let stream = self.inner.lock().unwrap();
+
+        device::get_device_buffer_frame_size(&stream.audio_unit)
+            .map(|size| size as crate::FrameCount)
+            .map_err(|_| crate::StreamError::DeviceNotAvailable)
     }
 }
 
@@ -285,7 +285,7 @@ mod test {
 
         let stream = device
             .build_output_stream(
-                &config,
+                config,
                 write_silence::<f32>,
                 move |err| println!("Error: {err}"),
                 None, // None=blocking, Some(Duration)=timeout
@@ -314,7 +314,7 @@ mod test {
 
         let stream = device
             .build_input_stream(
-                &config,
+                config,
                 move |data: &[f32], _: &crate::InputCallbackInfo| {
                     // react to stream events and read or write stream data here.
                     println!("Got data: {:?}", &data[..25]);
@@ -347,7 +347,7 @@ mod test {
         println!("Building input stream");
         let stream = device
             .build_input_stream(
-                &config,
+                config,
                 move |data: &[f32], _: &crate::InputCallbackInfo| {
                     // react to stream events and read or write stream data here.
                     println!("Got data: {:?}", &data[..25]);

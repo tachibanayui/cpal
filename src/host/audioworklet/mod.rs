@@ -5,6 +5,10 @@
 
 mod dependent_module;
 use js_sys::wasm_bindgen;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use crate::dependent_module;
 use wasm_bindgen::prelude::*;
@@ -14,7 +18,7 @@ use crate::{
     BackendSpecificError, BuildStreamError, ChannelCount, Data, DefaultStreamConfigError,
     DeviceDescription, DeviceDescriptionBuilder, DeviceId, DeviceIdError, DeviceNameError,
     DevicesError, InputCallbackInfo, OutputCallbackInfo, PauseStreamError, PlayStreamError,
-    SampleFormat, SampleRate, StreamConfig, StreamError, SupportedBufferSize,
+    SampleFormat, SampleRate, StreamConfig, StreamError, StreamInstant, SupportedBufferSize,
     SupportedStreamConfig, SupportedStreamConfigRange, SupportedStreamConfigsError,
 };
 
@@ -30,6 +34,7 @@ pub struct Host;
 
 pub struct Stream {
     audio_context: web_sys::AudioContext,
+    buffer_size_frames: Arc<AtomicU64>,
 }
 
 pub use crate::iter::{SupportedInputConfigs, SupportedOutputConfigs};
@@ -40,6 +45,9 @@ const MIN_SAMPLE_RATE: SampleRate = 8_000;
 const MAX_SAMPLE_RATE: SampleRate = 96_000;
 const DEFAULT_SAMPLE_RATE: SampleRate = 44_100;
 const SUPPORTED_SAMPLE_FORMAT: SampleFormat = SampleFormat::F32;
+
+// https://webaudio.github.io/web-audio-api/#render-quantum-size
+const DEFAULT_RENDER_SIZE: u64 = 128;
 
 impl Host {
     pub fn new() -> Result<Self, crate::HostUnavailable> {
@@ -162,7 +170,7 @@ impl DeviceTrait for Device {
 
     fn build_input_stream_raw<D, E>(
         &self,
-        _config: &StreamConfig,
+        _config: StreamConfig,
         _sample_format: SampleFormat,
         _data_callback: D,
         _error_callback: E,
@@ -177,9 +185,21 @@ impl DeviceTrait for Device {
     }
 
     /// Create an output stream.
+    ///
+    /// # Async completion
+    ///
+    /// This function returns `Ok` synchronously once the [`AudioContext`] is created, before the
+    /// AudioWorklet module has been loaded or the [`AudioWorkletNode`] has been initialized. The
+    /// actual worklet setup runs asynchronously via [`wasm_bindgen_futures::spawn_local`]. If
+    /// setup fails (e.g. `add_module` or `AudioWorkletNode` construction throws), the error is
+    /// delivered to `error_callback` after the caller already holds a [`Stream`]. There is no
+    /// way to surface such errors synchronously given the Web Audio API's design.
+    ///
+    /// [`AudioContext`]: web_sys::AudioContext
+    /// [`AudioWorkletNode`]: web_sys::AudioWorkletNode
     fn build_output_stream_raw<D, E>(
         &self,
-        config: &StreamConfig,
+        config: StreamConfig,
         sample_format: SampleFormat,
         mut data_callback: D,
         mut error_callback: E,
@@ -193,10 +213,15 @@ impl DeviceTrait for Device {
             return Err(BuildStreamError::StreamConfigNotSupported);
         }
 
-        let config = config.clone();
-
         let stream_opts = web_sys::AudioContextOptions::new();
         stream_opts.set_sample_rate(config.sample_rate as f32);
+        if let crate::BufferSize::Fixed(n) = config.buffer_size {
+            let _ = js_sys::Reflect::set(
+                stream_opts.as_ref(),
+                &JsValue::from_str("renderSizeHint"),
+                &JsValue::from_f64(n as f64),
+            );
+        }
 
         let audio_context = web_sys::AudioContext::new_with_context_options(&stream_opts).map_err(
             |err| -> BuildStreamError {
@@ -215,6 +240,12 @@ impl DeviceTrait for Device {
             destination.set_channel_count(config.channels as u32);
         }
 
+        let initial_quantum = match config.buffer_size {
+            crate::BufferSize::Fixed(n) => n as u64,
+            crate::BufferSize::Default => DEFAULT_RENDER_SIZE,
+        };
+        let buffer_size_frames = Arc::new(AtomicU64::new(initial_quantum));
+        let buffer_size_frames_cb = buffer_size_frames.clone();
         let ctx = audio_context.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let result: Result<(), JsValue> = async move {
@@ -230,22 +261,44 @@ impl DeviceTrait for Device {
                 options.set_output_channel_count(&js_array);
                 options.set_number_of_inputs(0);
 
+                // Capture audio output latency here: the closure runs in a separate worker and cannot access AudioContext properties directly.
+                // While baseLatency is fixed for the context lifetime, outputLatency can change but not be re-read from inside the worklet;
+                // we snapshot it here.
+                let base_latency_secs =
+                    js_sys::Reflect::get(ctx.as_ref(), &JsValue::from("baseLatency"))
+                        .ok()
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                let output_latency_secs =
+                    js_sys::Reflect::get(ctx.as_ref(), &JsValue::from("outputLatency"))
+                        .ok()
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                let total_output_latency_secs = {
+                    let sum = base_latency_secs + output_latency_secs;
+                    if sum.is_finite() {
+                        sum.max(0.0)
+                    } else {
+                        0.0
+                    }
+                };
+
                 options.set_processor_options(Some(&js_sys::Array::of3(
                     &wasm_bindgen::module(),
                     &wasm_bindgen::memory(),
                     &WasmAudioProcessor::new(Box::new(
                         move |interleaved_data, frame_size, sample_rate, now| {
+                            buffer_size_frames_cb.store(frame_size as u64, Ordering::Relaxed);
                             let data = interleaved_data.as_mut_ptr() as *mut ();
                             let mut data = unsafe {
                                 Data::from_parts(data, interleaved_data.len(), sample_format)
                             };
 
-                            let callback = crate::StreamInstant::from_secs_f64(now);
-
+                            let callback = StreamInstant::from_secs_f64(now);
                             let buffer_duration = frames_to_duration(frame_size as _, sample_rate);
-                            let playback = callback.add(buffer_duration).expect(
-                            "`playback` occurs beyond representation supported by `StreamInstant`",
-                        );
+                            let playback = callback
+                                + (buffer_duration
+                                    + Duration::from_secs_f64(total_output_latency_secs));
                             let timestamp = crate::OutputStreamTimestamp { callback, playback };
                             let info = OutputCallbackInfo { timestamp };
                             (data_callback)(&mut data, &info);
@@ -276,11 +329,18 @@ impl DeviceTrait for Device {
             }
         });
 
-        Ok(Stream { audio_context })
+        Ok(Stream {
+            audio_context,
+            buffer_size_frames,
+        })
     }
 }
 
 impl StreamTrait for Stream {
+    fn buffer_size(&self) -> Result<crate::FrameCount, crate::StreamError> {
+        Ok(self.buffer_size_frames.load(Ordering::Relaxed) as crate::FrameCount)
+    }
+
     fn play(&self) -> Result<(), PlayStreamError> {
         match self.audio_context.resume() {
             Ok(_) => Ok(()),
@@ -301,6 +361,10 @@ impl StreamTrait for Stream {
                 Err(err.into())
             }
         }
+    }
+
+    fn now(&self) -> StreamInstant {
+        StreamInstant::from_secs_f64(self.audio_context.current_time())
     }
 }
 
@@ -330,7 +394,7 @@ impl Iterator for Devices {
 }
 
 // Whether or not the given stream configuration is valid for building a stream.
-fn valid_config(conf: &StreamConfig, sample_format: SampleFormat) -> bool {
+fn valid_config(conf: StreamConfig, sample_format: SampleFormat) -> bool {
     conf.channels <= MAX_CHANNELS
         && conf.channels >= MIN_CHANNELS
         && conf.sample_rate <= MAX_SAMPLE_RATE
@@ -406,20 +470,8 @@ impl WasmAudioProcessor {
 
     /// Converts this `WasmAudioProcessor` into a raw pointer (as `usize`) for FFI use.
     ///
-    /// # Purpose
-    /// This function is intended to transfer ownership of the processor instance to the caller,
-    /// typically for passing between Rust and JavaScript via WebAssembly.
-    ///
-    /// # Relationship with [`unpack`]
-    /// The returned pointer must be passed to [`unpack`] exactly once to recover the original
-    /// `WasmAudioProcessor` instance. Failing to do so will result in a memory leak. Calling
-    /// [`unpack`] more than once or using the pointer after it has been unpacked will result in
-    /// undefined behavior.
-    ///
-    /// # Safety and Lifetime
-    /// After calling `pack`, the caller is responsible for ensuring that `unpack` is called
-    /// exactly once, and that the pointer is not used after being unpacked. This function
-    /// should be used with care, as improper use can lead to memory safety issues.
+    /// Transfers ownership of the processor to the caller. The returned pointer must be passed to
+    /// [`unpack`] exactly once. Failing to call [`unpack`] will leak the allocation.
     ///
     /// [`unpack`]: Self::unpack
     pub fn pack(self) -> usize {

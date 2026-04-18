@@ -28,12 +28,11 @@ use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use super::com;
 use super::{windows_err_to_cpal_err, windows_err_to_cpal_err_message};
+use crate::host::com;
 use windows::core::Interface;
 use windows::core::GUID;
 use windows::Win32::Devices::Properties;
-use windows::Win32::Foundation;
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::Media::Audio::IAudioRenderClient;
 use windows::Win32::Media::{Audio, KernelStreaming, Multimedia};
@@ -61,6 +60,10 @@ const PKEY_AUDIOENDPOINT_JACKSUBTYPE: PROPERTYKEY = PROPERTYKEY {
     fmtid: GUID::from_u128(0x1da5d803_d492_4edd_8c23_e0c0ffee7f0e),
     pid: 8,
 };
+
+const DEFAULT_FLAGS: u32 = Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+    | Audio::AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
+    | Audio::AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM;
 
 /// Wrapper because of that stupid decision to remove `Send` and `Sync` from raw pointers.
 #[derive(Clone)]
@@ -127,7 +130,7 @@ impl DeviceTrait for Device {
 
     fn build_input_stream_raw<D, E>(
         &self,
-        config: &StreamConfig,
+        config: StreamConfig,
         sample_format: SampleFormat,
         data_callback: D,
         error_callback: E,
@@ -147,7 +150,7 @@ impl DeviceTrait for Device {
 
     fn build_output_stream_raw<D, E>(
         &self,
-        config: &StreamConfig,
+        config: StreamConfig,
         sample_format: SampleFormat,
         data_callback: D,
         error_callback: E,
@@ -195,30 +198,13 @@ unsafe fn data_flow_from_immendpoint(endpoint: &Audio::IMMEndpoint) -> Audio::ED
 
 // Given the audio client and format, returns whether or not the format is supported.
 pub unsafe fn is_format_supported(
-    client: &Audio::IAudioClient,
-    waveformatex_ptr: *const Audio::WAVEFORMATEX,
+    _client: &Audio::IAudioClient,
+    _waveformatex_ptr: *const Audio::WAVEFORMATEX,
 ) -> Result<bool, SupportedStreamConfigsError> {
-    // Check if the given format is supported.
-    let mut closest_waveformatex_ptr: *mut Audio::WAVEFORMATEX = ptr::null_mut();
+    // Checking formats is not needed for shared mode with auto-conversion, therefore this check has been removed until someone implements WASAPI exclusive mode support
+    // I used an NAudio issue as reference: https://github.com/naudio/NAudio/issues/819
 
-    let result = client.IsFormatSupported(
-        Audio::AUDCLNT_SHAREMODE_SHARED,
-        waveformatex_ptr,
-        Some(&mut closest_waveformatex_ptr as *mut _),
-    );
-
-    if !closest_waveformatex_ptr.is_null() {
-        Com::CoTaskMemFree(Some(closest_waveformatex_ptr as *mut std::ffi::c_void));
-    }
-
-    // `IsFormatSupported` can return `S_FALSE` (which means that a compatible format
-    // has been found, but not an exact match) so we also treat this as unsupported.
-    match result {
-        Audio::AUDCLNT_E_DEVICE_INVALIDATED => Err(SupportedStreamConfigsError::DeviceNotAvailable),
-        r if r.is_err() => Ok(false),
-        Foundation::S_FALSE => Ok(false),
-        _ => Ok(true),
-    }
+    Ok(true)
 }
 
 // Get a cpal Format from a WAVEFORMATEX.
@@ -457,15 +443,15 @@ impl Device {
                 &PKEY_AUDIOENDPOINT_JACKSUBTYPE as *const _ as *const _,
             );
 
-            // Prefer DeviceDesc for name, fall back to FriendlyName
-            let name = device_desc
-                .clone()
-                .or(friendly_name.clone())
-                .ok_or_else(|| DeviceNameError::BackendSpecific {
-                    err: BackendSpecificError {
-                        description: "failed to retrieve device name".to_string(),
-                    },
-                })?;
+            // Prefer FriendlyName for name (e.g., "Speakers (XYZ Audio Adapter)"), fall back to DeviceDesc
+            let name =
+                friendly_name
+                    .or(device_desc)
+                    .ok_or_else(|| DeviceNameError::BackendSpecific {
+                        err: BackendSpecificError {
+                            description: "failed to retrieve device name".to_string(),
+                        },
+                    })?;
 
             // Get direction from data flow (eCapture = Input, eRender = Output)
             let direction = self.data_flow().into();
@@ -500,13 +486,6 @@ impl Device {
             // Add interface name to driver field if available
             if let Some(iface_name) = interface_name {
                 builder = builder.driver(iface_name);
-            }
-
-            // Add FriendlyName to extended if different from the name we used
-            if let Some(fname) = friendly_name {
-                if device_desc.is_some() && Some(&fname) != device_desc.as_ref() {
-                    builder = builder.add_extended_line(fname);
-                }
             }
 
             Ok(builder.build())
@@ -709,7 +688,7 @@ impl Device {
                     SampleFormat::F32,
                 ] {
                     if let Some(waveformat) = config_to_waveformatextensible(
-                        &StreamConfig {
+                        StreamConfig {
                             channels: format.channels,
                             sample_rate,
                             buffer_size: BufferSize::Default,
@@ -819,7 +798,7 @@ impl Device {
 
     pub(crate) fn build_input_stream_raw_inner(
         &self,
-        config: &StreamConfig,
+        config: StreamConfig,
         sample_format: SampleFormat,
     ) -> Result<StreamInner, BuildStreamError> {
         unsafe {
@@ -844,7 +823,7 @@ impl Device {
             // will return `AUDCLNT_E_BUFFER_SIZE_ERROR` if the buffer size is not supported.
             let buffer_duration = buffer_size_to_duration(&config.buffer_size, config.sample_rate);
 
-            let mut stream_flags = Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+            let mut stream_flags = DEFAULT_FLAGS;
 
             if self.data_flow() == Audio::eRender {
                 stream_flags |= Audio::AUDCLNT_STREAMFLAGS_LOOPBACK;
@@ -892,6 +871,9 @@ impl Device {
                 .GetBufferSize()
                 .map_err(windows_err_to_cpal_err::<BuildStreamError>)?;
 
+            let period_frames =
+                shared_mode_period_frames(&audio_client, config.sample_rate, max_frames_in_buffer);
+
             // Creating the event that will be signalled whenever we need to submit some samples.
             let event = {
                 let event =
@@ -927,6 +909,16 @@ impl Device {
 
             let audio_clock = get_audio_clock(&audio_client)?;
 
+            let stream_latency = {
+                let hns = audio_client.GetStreamLatency().map_err(|e| {
+                    windows_err_to_cpal_err_message::<BuildStreamError>(
+                        e,
+                        "failed to get stream latency: ",
+                    )
+                })?;
+                Duration::from_nanos(hns.max(0) as u64 * 100)
+            };
+
             Ok(StreamInner {
                 audio_client,
                 audio_clock,
@@ -934,16 +926,18 @@ impl Device {
                 event,
                 playing: false,
                 max_frames_in_buffer,
+                period_frames,
                 bytes_per_frame: waveformatex.nBlockAlign,
-                config: config.clone(),
+                config,
                 sample_format,
+                stream_latency,
             })
         }
     }
 
     pub(crate) fn build_output_stream_raw_inner(
         &self,
-        config: &StreamConfig,
+        config: StreamConfig,
         sample_format: SampleFormat,
     ) -> Result<StreamInner, BuildStreamError> {
         unsafe {
@@ -977,7 +971,7 @@ impl Device {
                 audio_client
                     .Initialize(
                         share_mode,
-                        Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                        DEFAULT_FLAGS,
                         buffer_duration,
                         0,
                         &format_attempt.Format,
@@ -1015,6 +1009,9 @@ impl Device {
                 )
             })?;
 
+            let period_frames =
+                shared_mode_period_frames(&audio_client, config.sample_rate, max_frames_in_buffer);
+
             // Building a `IAudioRenderClient` that will be used to fill the samples buffer.
             let render_client = audio_client
                 .GetService::<IAudioRenderClient>()
@@ -1031,6 +1028,16 @@ impl Device {
 
             let audio_clock = get_audio_clock(&audio_client)?;
 
+            let stream_latency = {
+                let hns = audio_client.GetStreamLatency().map_err(|e| {
+                    windows_err_to_cpal_err_message::<BuildStreamError>(
+                        e,
+                        "failed to get stream latency: ",
+                    )
+                })?;
+                Duration::from_nanos(hns.max(0) as u64 * 100)
+            };
+
             Ok(StreamInner {
                 audio_client,
                 audio_clock,
@@ -1038,9 +1045,11 @@ impl Device {
                 event,
                 playing: false,
                 max_frames_in_buffer,
+                period_frames,
                 bytes_per_frame: waveformatex.nBlockAlign,
-                config: config.clone(),
+                config,
                 sample_format,
+                stream_latency,
             })
         }
     }
@@ -1303,7 +1312,7 @@ unsafe fn get_audio_clock(
 //
 // Returns `None` if the WAVEFORMATEXTENSIBLE does not support the given format.
 fn config_to_waveformatextensible(
-    config: &StreamConfig,
+    config: StreamConfig,
     sample_format: SampleFormat,
 ) -> Option<Audio::WAVEFORMATEXTENSIBLE> {
     let format_tag = match sample_format {
@@ -1373,13 +1382,29 @@ fn config_to_waveformatextensible(
     Some(waveformatextensible)
 }
 
-fn buffer_size_to_duration(buffer_size: &BufferSize, sample_rate: u32) -> i64 {
+/// Get the default device period in frames for a shared-mode stream.
+fn shared_mode_period_frames(
+    audio_client: &Audio::IAudioClient,
+    sample_rate: crate::SampleRate,
+    max_frames_in_buffer: crate::FrameCount,
+) -> crate::FrameCount {
+    let mut default_period = 0i64;
+    if unsafe { audio_client.GetDevicePeriod(Some(&mut default_period), None) }.is_ok()
+        && default_period > 0
+    {
+        buffer_duration_to_frames(default_period, sample_rate)
+    } else {
+        max_frames_in_buffer
+    }
+}
+
+fn buffer_size_to_duration(buffer_size: &BufferSize, sample_rate: SampleRate) -> i64 {
     match buffer_size {
         BufferSize::Fixed(frames) => *frames as i64 * (1_000_000_000 / 100) / sample_rate as i64,
         BufferSize::Default => 0,
     }
 }
 
-fn buffer_duration_to_frames(buffer_duration: i64, sample_rate: u32) -> FrameCount {
+fn buffer_duration_to_frames(buffer_duration: i64, sample_rate: SampleRate) -> FrameCount {
     (buffer_duration * sample_rate as i64 * 100 / 1_000_000_000) as FrameCount
 }

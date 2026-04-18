@@ -1,13 +1,15 @@
 //! CoreAudio implementation for iOS using AVAudioSession and RemoteIO Audio Units.
 
+use std::ptr::NonNull;
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use coreaudio::audio_unit::render_callback::data;
 use coreaudio::audio_unit::{render_callback, AudioUnit, Element, Scope};
 use objc2_audio_toolbox::{kAudioOutputUnitProperty_EnableIO, kAudioUnitProperty_StreamFormat};
-use objc2_core_audio_types::AudioBuffer;
-
 use objc2_avf_audio::AVAudioSession;
+use objc2_core_audio_types::AudioBuffer;
 
 use super::{asbd_from_config, frames_to_duration, host_time_to_stream_instant};
 use crate::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -16,18 +18,19 @@ use crate::{
     BackendSpecificError, BufferSize, BuildStreamError, ChannelCount, Data,
     DefaultStreamConfigError, DeviceDescription, DeviceDescriptionBuilder, DeviceId, DeviceIdError,
     DeviceNameError, DevicesError, InputCallbackInfo, OutputCallbackInfo, PauseStreamError,
-    PlayStreamError, SampleFormat, SampleRate, StreamConfig, StreamError, SupportedBufferSize,
-    SupportedStreamConfig, SupportedStreamConfigRange, SupportedStreamConfigsError,
+    PlayStreamError, SampleFormat, SampleRate, StreamConfig, StreamError, StreamInstant,
+    SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange,
+    SupportedStreamConfigsError,
 };
 
 use self::enumerate::{
     default_input_device, default_output_device, Devices, SupportedInputConfigs,
     SupportedOutputConfigs,
 };
-use std::ptr::NonNull;
-use std::time::Duration;
 
 pub mod enumerate;
+mod session_event_manager;
+use session_event_manager::{ErrorCallbackMutex, SessionEventManager};
 
 // These days the default of iOS is now F32 and no longer I16
 const SUPPORTED_SAMPLE_FORMAT: SampleFormat = SampleFormat::F32;
@@ -152,7 +155,7 @@ impl DeviceTrait for Device {
 
     fn build_input_stream_raw<D, E>(
         &self,
-        config: &StreamConfig,
+        config: StreamConfig,
         sample_format: SampleFormat,
         data_callback: D,
         error_callback: E,
@@ -168,6 +171,9 @@ impl DeviceTrait for Device {
         // Query device buffer size for latency calculation
         let device_buffer_frames = Some(get_device_buffer_frames());
 
+        let error_callback: ErrorCallbackMutex = Arc::new(Mutex::new(Box::new(error_callback)));
+        let session_manager = SessionEventManager::new(error_callback.clone());
+
         // Set up input callback
         setup_input_callback(
             &mut audio_unit,
@@ -175,21 +181,28 @@ impl DeviceTrait for Device {
             config.sample_rate,
             device_buffer_frames,
             data_callback,
-            error_callback,
+            move |e| {
+                if let Ok(mut cb) = error_callback.lock() {
+                    cb(e);
+                }
+            },
         )?;
 
         audio_unit.start()?;
 
-        Ok(Stream::new(StreamInner {
-            playing: true,
-            audio_unit,
-        }))
+        Ok(Stream::new(
+            StreamInner {
+                playing: true,
+                audio_unit,
+            },
+            session_manager,
+        ))
     }
 
     /// Create an output stream.
     fn build_output_stream_raw<D, E>(
         &self,
-        config: &StreamConfig,
+        config: StreamConfig,
         sample_format: SampleFormat,
         data_callback: D,
         error_callback: E,
@@ -205,6 +218,9 @@ impl DeviceTrait for Device {
         // Query device buffer size for latency calculation
         let device_buffer_frames = Some(get_device_buffer_frames());
 
+        let error_callback: ErrorCallbackMutex = Arc::new(Mutex::new(Box::new(error_callback)));
+        let session_manager = SessionEventManager::new(error_callback.clone());
+
         // Set up output callback
         setup_output_callback(
             &mut audio_unit,
@@ -212,40 +228,42 @@ impl DeviceTrait for Device {
             config.sample_rate,
             device_buffer_frames,
             data_callback,
-            error_callback,
+            move |e| {
+                if let Ok(mut cb) = error_callback.lock() {
+                    cb(e);
+                }
+            },
         )?;
 
         audio_unit.start()?;
 
-        Ok(Stream::new(StreamInner {
-            playing: true,
-            audio_unit,
-        }))
+        Ok(Stream::new(
+            StreamInner {
+                playing: true,
+                audio_unit,
+            },
+            session_manager,
+        ))
     }
 }
 
 pub struct Stream {
     inner: Mutex<StreamInner>,
+    _session_manager: SessionEventManager,
 }
 
 impl Stream {
-    fn new(inner: StreamInner) -> Self {
+    fn new(inner: StreamInner, session_manager: SessionEventManager) -> Self {
         Self {
             inner: Mutex::new(inner),
+            _session_manager: session_manager,
         }
     }
 }
 
 impl StreamTrait for Stream {
     fn play(&self) -> Result<(), PlayStreamError> {
-        let mut stream = self
-            .inner
-            .lock()
-            .map_err(|_| PlayStreamError::BackendSpecific {
-                err: BackendSpecificError {
-                    description: "A cpal stream operation panicked while holding the lock - this is a bug, please report it".to_string(),
-                },
-            })?;
+        let mut stream = self.inner.lock().expect("stream lock poisoned");
 
         if !stream.playing {
             if let Err(e) = stream.audio_unit.start() {
@@ -259,14 +277,7 @@ impl StreamTrait for Stream {
     }
 
     fn pause(&self) -> Result<(), PauseStreamError> {
-        let mut stream = self
-            .inner
-            .lock()
-            .map_err(|_| PauseStreamError::BackendSpecific {
-                err: BackendSpecificError {
-                    description: "A cpal stream operation panicked while holding the lock - this is a bug, please report it".to_string(),
-                },
-            })?;
+        let mut stream = self.inner.lock().expect("stream lock poisoned");
 
         if stream.playing {
             if let Err(e) = stream.audio_unit.stop() {
@@ -274,10 +285,18 @@ impl StreamTrait for Stream {
                 let err = BackendSpecificError { description };
                 return Err(err.into());
             }
-
             stream.playing = false;
         }
         Ok(())
+    }
+
+    fn now(&self) -> StreamInstant {
+        let m_host_time = unsafe { mach2::mach_time::mach_absolute_time() };
+        host_time_to_stream_instant(m_host_time).expect("mach_timebase_info failed")
+    }
+
+    fn buffer_size(&self) -> Result<crate::FrameCount, crate::StreamError> {
+        Ok(get_device_buffer_frames() as crate::FrameCount)
     }
 }
 
@@ -389,7 +408,7 @@ fn get_supported_stream_configs(is_input: bool) -> std::vec::IntoIter<SupportedS
 
 /// Setup audio unit with common configuration for input or output streams.
 fn setup_stream_audio_unit(
-    config: &StreamConfig,
+    config: StreamConfig,
     sample_format: SampleFormat,
     is_input: bool,
 ) -> Result<AudioUnit, BuildStreamError> {
@@ -498,9 +517,7 @@ where
             }
         });
         let delay = frames_to_duration(latency_frames, sample_rate);
-        let capture = callback
-            .sub(delay)
-            .expect("`capture` occurs before origin of alsa `StreamInstant`");
+        let capture = callback.checked_sub(delay).unwrap_or(StreamInstant::ZERO);
         let timestamp = crate::InputStreamTimestamp { callback, capture };
 
         let info = InputCallbackInfo { timestamp };
@@ -549,9 +566,7 @@ where
             }
         });
         let delay = frames_to_duration(latency_frames, sample_rate);
-        let playback = callback
-            .add(delay)
-            .expect("`playback` occurs beyond representation supported by `StreamInstant`");
+        let playback = callback + delay;
         let timestamp = crate::OutputStreamTimestamp { callback, playback };
 
         let info = OutputCallbackInfo { timestamp };

@@ -14,10 +14,11 @@ use crate::{
     BackendSpecificError, BufferSize, BuildStreamError, Data, DefaultStreamConfigError,
     DeviceDescription, DeviceDescriptionBuilder, DeviceId, DeviceIdError, DeviceNameError,
     DevicesError, InputCallbackInfo, OutputCallbackInfo, PauseStreamError, PlayStreamError,
-    SampleFormat, SampleRate, StreamConfig, StreamError, SupportedBufferSize,
+    SampleFormat, SampleRate, StreamConfig, StreamError, StreamInstant, SupportedBufferSize,
     SupportedStreamConfig, SupportedStreamConfigRange, SupportedStreamConfigsError,
 };
 use std::ops::DerefMut;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -37,6 +38,7 @@ pub struct Stream {
     on_ended_closures: Vec<ClosureHandle>,
     config: StreamConfig,
     buffer_size_frames: usize,
+    is_started: Arc<AtomicBool>,
 }
 
 // WASM runs in a single-threaded environment, so Send and Sync are safe by design.
@@ -186,7 +188,7 @@ impl DeviceTrait for Device {
 
     fn build_input_stream_raw<D, E>(
         &self,
-        _config: &StreamConfig,
+        _config: StreamConfig,
         _sample_format: SampleFormat,
         _data_callback: D,
         _error_callback: E,
@@ -203,10 +205,10 @@ impl DeviceTrait for Device {
     /// Create an output stream.
     fn build_output_stream_raw<D, E>(
         &self,
-        config: &StreamConfig,
+        config: StreamConfig,
         sample_format: SampleFormat,
         data_callback: D,
-        _error_callback: E,
+        error_callback: E,
         _timeout: Option<Duration>,
     ) -> Result<Self::Stream, BuildStreamError>
     where
@@ -232,6 +234,10 @@ impl DeviceTrait for Device {
         let buffer_time_step_secs = buffer_time_step_secs(buffer_size_frames, config.sample_rate);
 
         let data_callback = Arc::new(Mutex::new(Box::new(data_callback)));
+        let error_callback = Arc::new(Mutex::new(
+            Box::new(error_callback) as Box<dyn FnMut(StreamError) + Send + 'static>
+        ));
+        let is_started = Arc::new(AtomicBool::new(false));
 
         // Create the WebAudio stream.
         let stream_opts = AudioContextOptions::new();
@@ -263,11 +269,18 @@ impl DeviceTrait for Device {
         // A cursor keeping track of the current time at which new frames should be scheduled.
         let time = Arc::new(RwLock::new(0f64));
 
+        // baseLatency is fixed for the lifetime of the AudioContext.
+        let base_latency_secs = js_sys::Reflect::get(ctx.as_ref(), &JsValue::from("baseLatency"))
+            .ok()
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+
         // Create a set of closures / callbacks which will continuously fetch and schedule sample
         // playback. Starting with two workers, e.g. a front and back buffer so that audio frames
         // can be fetched in the background.
         for _i in 0..2 {
             let data_callback_handle = data_callback.clone();
+            let error_callback_handle = error_callback.clone();
             let ctx_handle = ctx.clone();
             let time_handle = time.clone();
 
@@ -315,12 +328,13 @@ impl DeviceTrait for Device {
                             .expect("Unable to get a read lock on the time cursor");
                         // Synchronise first buffer as necessary (eg. keep the time value
                         // referenced to the context clock).
-                        if *time_at_start_of_buffer > 0.001 {
+                        if *time_at_start_of_buffer > 0.0 {
                             *time_at_start_of_buffer
                         } else {
-                            // 25ms of time to fetch the first sample data, increase to avoid
-                            // initial underruns.
-                            now + 0.025
+                            // Schedule the first buffer far enough ahead for the browser's
+                            // internal audio pipeline (baseLatency) plus one full buffer of
+                            // data, so playback starts underrun-free at any buffer size.
+                            now + base_latency_secs + buffer_time_step_secs
                         }
                     };
 
@@ -330,8 +344,26 @@ impl DeviceTrait for Device {
                         let data = temporary_buffer.as_mut_ptr() as *mut ();
                         let mut data = unsafe { Data::from_parts(data, len, sample_format) };
                         let mut data_callback = data_callback_handle.lock().unwrap();
-                        let callback = crate::StreamInstant::from_secs_f64(now);
-                        let playback = crate::StreamInstant::from_secs_f64(time_at_start_of_buffer);
+                        // outputLatency can change at runtime, so read it each callback.
+                        let output_latency_secs = js_sys::Reflect::get(
+                            ctx_handle.as_ref(),
+                            &JsValue::from("outputLatency"),
+                        )
+                        .ok()
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                        let total_hw_latency_secs = {
+                            let sum = base_latency_secs + output_latency_secs;
+                            if sum.is_finite() {
+                                sum.max(0.0)
+                            } else {
+                                0.0
+                            }
+                        };
+                        let callback = StreamInstant::from_secs_f64(now);
+                        let playback = StreamInstant::from_secs_f64(
+                            time_at_start_of_buffer + total_hw_latency_secs,
+                        );
                         let timestamp = crate::OutputStreamTimestamp { callback, playback };
                         let info = OutputCallbackInfo { timestamp };
                         (data_callback.deref_mut())(&mut data, &info);
@@ -348,11 +380,18 @@ impl DeviceTrait for Device {
 
                         #[cfg(not(target_feature = "atomics"))]
                         {
-                            ctx_buffer
+                            if let Err(err) = ctx_buffer
                                 .copy_to_channel(&temporary_channel_buffer, channel as i32)
-                                .expect(
-                                    "Unable to write sample data into the audio context buffer",
+                            {
+                                let description = format!("{err:?}");
+                                let err = BackendSpecificError { description };
+                                (error_callback_handle
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner()))(
+                                    StreamError::BackendSpecific { err },
                                 );
+                                return;
+                            }
                         }
 
                         // copyToChannel cannot be directly copied into from a SharedArrayBuffer,
@@ -363,42 +402,77 @@ impl DeviceTrait for Device {
                         #[cfg(target_feature = "atomics")]
                         {
                             temporary_channel_array_view.copy_from(&temporary_channel_buffer);
-                            ctx_buffer
+                            if let Err(err) = ctx_buffer
                                 .unchecked_ref::<ExternalArrayAudioBuffer>()
                                 .copy_to_channel(&temporary_channel_array_view, channel as i32)
-                                .expect(
-                                    "Unable to write sample data into the audio context buffer",
+                            {
+                                let description = format!("{err:?}");
+                                let err = BackendSpecificError { description };
+                                (error_callback_handle
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner()))(
+                                    StreamError::BackendSpecific { err },
                                 );
+                                return;
+                            }
                         }
                     }
 
                     // Create an AudioBufferSourceNode, schedule it to playback the reused buffer
                     // in the future.
-                    let source = ctx_handle
-                        .create_buffer_source()
-                        .expect("Unable to create a webaudio buffer source");
+                    let source = match ctx_handle.create_buffer_source() {
+                        Ok(s) => s,
+                        Err(err) => {
+                            let description = format!("{err:?}");
+                            let err = BackendSpecificError { description };
+                            (error_callback_handle
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()))(
+                                StreamError::BackendSpecific { err },
+                            );
+                            return;
+                        }
+                    };
                     source.set_buffer(Some(&ctx_buffer));
-                    source
-                        .connect_with_audio_node(&ctx_handle.destination())
-                        .expect(
-                        "Unable to connect the web audio buffer source to the context destination",
-                    );
-                    source
-                        .add_event_listener_with_callback(
-                            "ended",
-                            on_ended_closure_handle
-                                .read()
-                                .unwrap()
-                                .as_ref()
-                                .unwrap()
-                                .as_ref()
-                                .unchecked_ref(),
-                        )
-                        .expect("Failed to add ended event listener");
-
-                    source
-                        .start_with_when(time_at_start_of_buffer)
-                        .expect("Unable to start the webaudio buffer source");
+                    if let Err(err) = source.connect_with_audio_node(&ctx_handle.destination()) {
+                        let description = format!("{err:?}");
+                        let err = BackendSpecificError { description };
+                        (error_callback_handle
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()))(
+                            StreamError::BackendSpecific { err },
+                        );
+                        return;
+                    }
+                    if let Err(err) = source.add_event_listener_with_callback(
+                        "ended",
+                        on_ended_closure_handle
+                            .read()
+                            .unwrap()
+                            .as_ref()
+                            .unwrap()
+                            .as_ref()
+                            .unchecked_ref(),
+                    ) {
+                        let description = format!("{err:?}");
+                        let err = BackendSpecificError { description };
+                        (error_callback_handle
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()))(
+                            StreamError::BackendSpecific { err },
+                        );
+                        return;
+                    }
+                    if let Err(err) = source.start_with_when(time_at_start_of_buffer) {
+                        let description = format!("{err:?}");
+                        let err = BackendSpecificError { description };
+                        (error_callback_handle
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()))(
+                            StreamError::BackendSpecific { err },
+                        );
+                        return;
+                    }
 
                     // Keep track of when the next buffer worth of samples should be played.
                     *time_handle.write().unwrap() = time_at_start_of_buffer + buffer_time_step_secs;
@@ -410,8 +484,9 @@ impl DeviceTrait for Device {
         Ok(Stream {
             ctx,
             on_ended_closures,
-            config: config.clone(),
+            config,
             buffer_size_frames,
+            is_started,
         })
     }
 }
@@ -429,12 +504,20 @@ impl StreamTrait for Stream {
         let window = web_sys::window().unwrap();
         match self.ctx.resume() {
             Ok(_) => {
+                // Only schedule the initial timeouts once.
+                if self
+                    .is_started
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
+                    return Ok(());
+                }
                 // Begin webaudio playback, initially scheduling the closures to fire on a timeout
-                // event.
-                let mut offset_ms = 10;
+                // event. Minimum value as per spec: https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#timers
+                let mut offset_ms = 4;
                 let time_step_secs =
                     buffer_time_step_secs(self.buffer_size_frames, self.config.sample_rate);
-                let time_step_ms = (time_step_secs * 1_000.0) as i32;
+                let time_step_ms = ((time_step_secs * 1_000.0).ceil() as i32).max(1);
                 for on_ended_closure in self.on_ended_closures.iter() {
                     window
                         .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -469,6 +552,14 @@ impl StreamTrait for Stream {
                 Err(err.into())
             }
         }
+    }
+
+    fn now(&self) -> StreamInstant {
+        StreamInstant::from_secs_f64(self.ctx.current_time())
+    }
+
+    fn buffer_size(&self) -> Result<crate::FrameCount, crate::StreamError> {
+        Ok(self.buffer_size_frames as crate::FrameCount)
     }
 }
 
@@ -520,7 +611,7 @@ fn is_webaudio_available() -> bool {
 }
 
 // Whether or not the given stream configuration is valid for building a stream.
-fn valid_config(conf: &StreamConfig, sample_format: SampleFormat) -> bool {
+fn valid_config(conf: StreamConfig, sample_format: SampleFormat) -> bool {
     conf.channels <= MAX_CHANNELS
         && conf.channels >= MIN_CHANNELS
         && conf.sample_rate <= MAX_SAMPLE_RATE

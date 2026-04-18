@@ -33,28 +33,27 @@ impl Device {
         connect_ports_automatically: bool,
         start_server_automatically: bool,
         direction: DeviceDirection,
-    ) -> Result<Self, String> {
-        // ClientOptions are bit flags that you can set with the constants provided
+    ) -> Result<Self, BackendSpecificError> {
         let client_options = super::get_client_options(start_server_automatically);
 
-        // Create a dummy client to find out the sample rate of the server to be able to provide it as a possible config.
-        // This client will be dropped, and a new one will be created when making the stream.
-        // This is a hack due to the fact that the Client must be moved to create the AsyncClient.
-        match super::get_client(&name, client_options) {
-            Ok(client) => Ok(Device {
-                // The name given to the client by JACK, could potentially be different from the name supplied e.g.if there is a name collision
-                name: client.name().to_string(),
-                sample_rate: client.sample_rate() as u32,
-                buffer_size: SupportedBufferSize::Range {
-                    min: client.buffer_size(),
-                    max: client.buffer_size(),
-                },
-                direction,
-                start_server_automatically,
-                connect_ports_automatically,
-            }),
-            Err(e) => Err(e),
-        }
+        // Create a dummy client to find out the sample rate of the server to be able to provide it
+        // as a possible config. This client will be dropped, and a new one will be created when
+        // making the stream. This is a hack due to the fact that the Client must be moved to
+        // create the AsyncClient.
+        let client = super::get_client(&name, client_options)?;
+        Ok(Self {
+            // The name given to the client by JACK, could potentially be different from the name
+            // supplied e.g. if there is a name collision
+            name: client.name().to_string(),
+            sample_rate: client.sample_rate(),
+            buffer_size: SupportedBufferSize::Range {
+                min: client.buffer_size(),
+                max: client.buffer_size(),
+            },
+            direction,
+            start_server_automatically,
+            connect_ports_automatically,
+        })
     }
 
     fn id(&self) -> Result<DeviceId, DeviceIdError> {
@@ -65,7 +64,7 @@ impl Device {
         name: &str,
         connect_ports_automatically: bool,
         start_server_automatically: bool,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, BackendSpecificError> {
         let output_client_name = format!("{}_out", name);
         Device::new_device(
             output_client_name,
@@ -79,7 +78,7 @@ impl Device {
         name: &str,
         connect_ports_automatically: bool,
         start_server_automatically: bool,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, BackendSpecificError> {
         let input_client_name = format!("{}_in", name);
         Device::new_device(
             input_client_name,
@@ -132,20 +131,6 @@ impl Device {
     pub fn is_output(&self) -> bool {
         matches!(self.direction, DeviceDirection::Output)
     }
-
-    /// Validate buffer size if Fixed is specified. This is necessary because JACK buffer size
-    /// is controlled by the JACK server and cannot be changed by clients. Without validation,
-    /// cpal would silently use the server's buffer size even if a different value was requested.
-    fn validate_buffer_size(&self, conf: &StreamConfig) -> Result<(), BuildStreamError> {
-        if let crate::BufferSize::Fixed(requested_size) = conf.buffer_size {
-            if let SupportedBufferSize::Range { min, max } = self.buffer_size {
-                if !(min..=max).contains(&requested_size) {
-                    return Err(BuildStreamError::StreamConfigNotSupported);
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 impl DeviceTrait for Device {
@@ -191,11 +176,11 @@ impl DeviceTrait for Device {
 
     fn build_input_stream_raw<D, E>(
         &self,
-        conf: &StreamConfig,
+        conf: StreamConfig,
         sample_format: SampleFormat,
         data_callback: D,
         error_callback: E,
-        _timeout: Option<Duration>,
+        timeout: Option<Duration>,
     ) -> Result<Self::Stream, BuildStreamError>
     where
         D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
@@ -205,38 +190,60 @@ impl DeviceTrait for Device {
             // Trying to create an input stream from an output device
             return Err(BuildStreamError::StreamConfigNotSupported);
         }
-        if conf.sample_rate != self.sample_rate || sample_format != JACK_SAMPLE_FORMAT {
+        if sample_format != JACK_SAMPLE_FORMAT {
             return Err(BuildStreamError::StreamConfigNotSupported);
         }
-        self.validate_buffer_size(conf)?;
 
-        // The settings should be fine, create a Client
-        let client_options = super::get_client_options(self.start_server_automatically);
-        let client;
-        match super::get_client(&self.name, client_options) {
-            Ok(c) => client = c,
-            Err(e) => {
-                return Err(BuildStreamError::BackendSpecific {
-                    err: BackendSpecificError { description: e },
-                })
+        let name = self.name.clone();
+        let start_server_automatically = self.start_server_automatically;
+        let connect_ports_automatically = self.connect_ports_automatically;
+
+        let build = move || -> Result<Stream, BuildStreamError> {
+            // Create a fresh client to validate against live server state.
+            let client_options = super::get_client_options(start_server_automatically);
+            let client = super::get_client(&name, client_options)
+                .map_err(|err| BuildStreamError::BackendSpecific { err })?;
+            if conf.sample_rate != client.sample_rate() {
+                return Err(BuildStreamError::StreamConfigNotSupported);
             }
+            if let crate::BufferSize::Fixed(size) = conf.buffer_size {
+                if size != client.buffer_size() {
+                    return Err(BuildStreamError::StreamConfigNotSupported);
+                }
+            }
+            let mut stream =
+                Stream::new_input(client, conf.channels, data_callback, error_callback)?;
+            if connect_ports_automatically {
+                stream.connect_to_system_inputs();
+            }
+            Ok(stream)
         };
-        let mut stream = Stream::new_input(client, conf.channels, data_callback, error_callback);
 
-        if self.connect_ports_automatically {
-            stream.connect_to_system_inputs();
+        if let Some(dur) = timeout {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                tx.send(build()).ok();
+            });
+            match rx.recv_timeout(dur) {
+                Ok(result) => result,
+                Err(_) => Err(BuildStreamError::BackendSpecific {
+                    err: BackendSpecificError {
+                        description: "timed out waiting for JACK server".into(),
+                    },
+                }),
+            }
+        } else {
+            build()
         }
-
-        Ok(stream)
     }
 
     fn build_output_stream_raw<D, E>(
         &self,
-        conf: &StreamConfig,
+        conf: StreamConfig,
         sample_format: SampleFormat,
         data_callback: D,
         error_callback: E,
-        _timeout: Option<Duration>,
+        timeout: Option<Duration>,
     ) -> Result<Self::Stream, BuildStreamError>
     where
         D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
@@ -246,29 +253,51 @@ impl DeviceTrait for Device {
             // Trying to create an output stream from an input device
             return Err(BuildStreamError::StreamConfigNotSupported);
         }
-        if conf.sample_rate != self.sample_rate || sample_format != JACK_SAMPLE_FORMAT {
+        if sample_format != JACK_SAMPLE_FORMAT {
             return Err(BuildStreamError::StreamConfigNotSupported);
         }
-        self.validate_buffer_size(conf)?;
 
-        // The settings should be fine, create a Client
-        let client_options = super::get_client_options(self.start_server_automatically);
-        let client;
-        match super::get_client(&self.name, client_options) {
-            Ok(c) => client = c,
-            Err(e) => {
-                return Err(BuildStreamError::BackendSpecific {
-                    err: BackendSpecificError { description: e },
-                })
+        let name = self.name.clone();
+        let start_server_automatically = self.start_server_automatically;
+        let connect_ports_automatically = self.connect_ports_automatically;
+
+        let build = move || -> Result<Stream, BuildStreamError> {
+            // Create a fresh client to validate against live server state.
+            let client_options = super::get_client_options(start_server_automatically);
+            let client = super::get_client(&name, client_options)
+                .map_err(|err| BuildStreamError::BackendSpecific { err })?;
+            if conf.sample_rate != client.sample_rate() {
+                return Err(BuildStreamError::StreamConfigNotSupported);
             }
+            if let crate::BufferSize::Fixed(size) = conf.buffer_size {
+                if size != client.buffer_size() {
+                    return Err(BuildStreamError::StreamConfigNotSupported);
+                }
+            }
+            let mut stream =
+                Stream::new_output(client, conf.channels, data_callback, error_callback)?;
+            if connect_ports_automatically {
+                stream.connect_to_system_outputs();
+            }
+            Ok(stream)
         };
-        let mut stream = Stream::new_output(client, conf.channels, data_callback, error_callback);
 
-        if self.connect_ports_automatically {
-            stream.connect_to_system_outputs();
+        if let Some(dur) = timeout {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                tx.send(build()).ok();
+            });
+            match rx.recv_timeout(dur) {
+                Ok(result) => result,
+                Err(_) => Err(BuildStreamError::BackendSpecific {
+                    err: BackendSpecificError {
+                        description: "timed out waiting for JACK server".into(),
+                    },
+                }),
+            }
+        } else {
+            build()
         }
-
-        Ok(stream)
     }
 }
 
