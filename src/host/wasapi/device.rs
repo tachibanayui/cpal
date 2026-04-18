@@ -1,4 +1,4 @@
-use crate::host::wasapi::com::ComString;
+use crate::host::com::ComString;
 use crate::{
     BackendSpecificError, BufferSize, Data, DefaultStreamConfigError, DeviceDescription,
     DeviceDescriptionBuilder, DeviceDirection, DeviceId, DeviceIdError, DeviceNameError,
