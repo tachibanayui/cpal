@@ -32,7 +32,9 @@ use crate::host::com;
 use windows::core::Interface;
 use windows::core::GUID;
 use windows::Win32::Devices::Properties;
+use windows::Win32::Foundation;
 use windows::Win32::Foundation::PROPERTYKEY;
+use windows::Win32::Media::Audio::IAudioClient;
 use windows::Win32::Media::Audio::IAudioRenderClient;
 use windows::Win32::Media::{Audio, KernelStreaming, Multimedia};
 use windows::Win32::System::Com;
@@ -1275,4 +1277,64 @@ fn buffer_size_to_duration(buffer_size: &BufferSize, sample_rate: SampleRate) ->
 
 fn buffer_duration_to_frames(buffer_duration: i64, sample_rate: SampleRate) -> FrameCount {
     (buffer_duration * sample_rate as i64 * 100 / 1_000_000_000) as FrameCount
+}
+
+#[allow(dead_code)]
+fn activate_audio_interface_sync(
+    dev_iface_path: windows::core::PWSTR,
+    params: Option<*const StructuredStorage::PROPVARIANT>,
+    timeout: Duration,
+) -> windows::core::Result<Audio::IAudioClient> {
+    use windows::core::IUnknown;
+    #[windows::core::implement(Audio::IActivateAudioInterfaceCompletionHandler)]
+    struct SyncHandler(Foundation::HANDLE);
+    impl Audio::IActivateAudioInterfaceCompletionHandler_Impl for SyncHandler_Impl {
+        fn ActivateCompleted(
+            &self,
+            _: windows::core::Ref<Audio::IActivateAudioInterfaceAsyncOperation>,
+        ) -> windows::core::Result<()> {
+            unsafe {
+                Threading::SetEvent(self.0)?;
+                Foundation::CloseHandle(self.0)
+            }
+        }
+    }
+
+    unsafe {
+        let ev = Threading::CreateEventW(None, false, false, None)?;
+        let handler: Audio::IActivateAudioInterfaceCompletionHandler = SyncHandler(ev).into();
+        let async_op = Audio::ActivateAudioInterfaceAsync(
+            dev_iface_path,
+            &Audio::IAudioClient::IID,
+            params,
+            &handler,
+        )?;
+
+        Threading::WaitForSingleObject(ev, timeout.as_millis() as _);
+        let mut result = windows::core::HRESULT::default();
+        let mut interface: Option<IUnknown> = None;
+        if let Err(e) = async_op.GetActivateResult(&mut result, &mut interface) {
+            // Handle timeouts: https://learn.microsoft.com/en-us/windows/win32/api/mmdeviceapi/nf-mmdeviceapi-iactivateaudiointerfaceasyncoperation-getactivateresult#return-value
+            if e.code() == Foundation::E_ILLEGAL_METHOD_CALL {
+                return Err(windows::core::Error::new(
+                    Audio::AUDCLNT_E_DEVICE_INVALIDATED,
+                    "timeout waiting for audio interface activation",
+                ));
+            } else {
+                return Err(e);
+            }
+        }
+
+        result.ok()?;
+        let audio = interface
+            .ok_or_else(|| {
+                windows::core::Error::new(
+                    Audio::AUDCLNT_E_DEVICE_INVALIDATED,
+                    "audio interface could not be retrieved during activation",
+                )
+            })?
+            .cast::<IAudioClient>()?;
+
+        Ok(audio)
+    }
 }
