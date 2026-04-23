@@ -553,11 +553,20 @@ jobs:
         shell: bash
         run: |
           cargo generate-lockfile
-          cargo update -p windows --precise ${{ matrix.version }}
+          WINDOWS_VERSION=${{ matrix.version }}
+          cargo update -p windows --precise $WINDOWS_VERSION
+          TRANSITIVE=$(cargo pkgid windows-core 2>&1 | grep -oE "windows-core@[0-9.]+" | cut -d'@' -f2 | head -1 || true)   
+          DIRECT=$(cargo pkgid windows-core 2>&1 | grep -oE "windows-core@[0-9.]+" | cut -d'@' -f2 | tail -1 || true)   
+          if [[ -n "$TRANSITIVE" && $TRANSITIVE != $DIRECT ]]; then
+            echo "Forcing downgrade of windows-core@$DIRECT to $TRANSITIVE..."
+            cargo update -p "windows-core@$DIRECT" --precise $TRANSITIVE
+          fi
           echo "Locked windows crate version:"
           cargo tree | grep "windows v" || echo "Windows crate not found in dependency tree"
           echo "Cargo.lock entry:"
           grep -A 5 "name = \"windows\"" Cargo.lock | head -10
+          echo "cargo tree output:"
+          cargo tree
 
       - name: Check WASAPI with windows v${{ matrix.version }}
         run: cargo +${{ env.MSRV_WINDOWS }} check --workspace --verbose

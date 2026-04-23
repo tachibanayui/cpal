@@ -20,10 +20,7 @@ audio_thread_priority = ["dep:audio_thread_priority"]
 # Provides low-latency audio I/O by bypassing the Windows audio stack
 # Requires: ASIO drivers and LLVM/Clang for build-time bindings
 # See README for detailed setup instructions
-asio = [
-    "dep:asio-sys",
-    "dep:num-traits",
-]
+asio = ["dep:asio-sys", "dep:num-traits"]
 
 # Audio Worklet backend for WebAssembly
 # Provides lower-latency web audio processing compared to default Web Audio API
@@ -84,6 +81,7 @@ clap = { version = ">=4.0, <=4.5.57", features = ["derive"] }
 # versions when bumping to a new release, and only increase the minimum when absolutely necessary.
 # When updating this, also update the "windows-version" matrix in the CI workflow.
 [target.'cfg(target_os = "windows")'.dependencies]
+windows-core = { version = ">=0.59, <=0.62" }
 windows = { version = ">=0.59, <=0.62", features = [
     "Win32_Media",
     "Win32_Media_Audio",
